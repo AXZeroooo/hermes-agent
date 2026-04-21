@@ -166,12 +166,56 @@ def _approval_key_aliases(pattern_key: str) -> set[str]:
 # Detection
 # =========================================================================
 
+# Shell tokens that the shell removes or substitutes during tokenization but
+# that the literal-string regex layer still sees as opaque characters. These
+# are deterministic bypasses of the pattern-based detection (the shell will
+# always strip/substitute them), so we apply the same transform here before
+# matching.
+_EMPTY_QUOTE_RE = re.compile(r"''|\"\"")
+_IFS_EXPANSION_RE = re.compile(r'\$\{IFS\}|\$IFS\b', re.IGNORECASE)
+# $'...' is bash ANSI-C quoting — \xNN, \NNN (octal), \cX, \uNNNN sequences
+# expand to literal bytes at exec time. We decode only the \xNN form here
+# because that's the documented bypass; other escapes (\n, \t) don't help an
+# attacker hide a pattern match.
+_ANSI_C_QUOTE_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
+# Command substitution $(cmd args) — the outer command's name can be hidden
+# behind an expansion. We rescan the inner command so that
+# `$(echo rm) -rf /tmp` is recognised via the inner `rm`. Nested substitutions
+# are handled by iterating until stable.
+_CMD_SUBST_RE = re.compile(r'\$\(([^()]*)\)')
+_BACKTICK_SUBST_RE = re.compile(r'`([^`]*)`')
+# Quoted identifier tokens — 'rm', "rm", etc. The shell strips the quotes at
+# tokenize time, leaving a bare identifier. Only strip when the body is a
+# single shell-safe identifier so we don't mangle legit quoted strings that
+# contain spaces or shell metacharacters.
+_QUOTED_IDENT_RE = re.compile(r"""(?x)
+    (?:'([A-Za-z0-9_\-./+]+)'|"([A-Za-z0-9_\-./+]+)")
+""")
+
+
+def _decode_ansi_c_body(body: str) -> str:
+    """Expand \\xNN escapes inside a $'...' ANSI-C-quoted body."""
+    def _sub(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return m.group(0)
+    return re.sub(r'\\x([0-9a-fA-F]{2})', _sub, body)
+
+
 def _normalize_command_for_detection(command: str) -> str:
     """Normalize a command string before dangerous-pattern matching.
 
     Strips ANSI escape sequences (full ECMA-48 via tools.ansi_strip),
-    null bytes, and normalizes Unicode fullwidth characters so that
-    obfuscation techniques cannot bypass the pattern-based detection.
+    null bytes, and normalizes Unicode fullwidth characters.
+
+    Note: This function does NOT expand shell-tokenization obfuscations
+    (``${IFS}``, ``$'\\xNN'``, ``$(cmd)``). Those are handled by the
+    complementary ``_expand_shell_obfuscations`` pass, which is run
+    alongside this one — some DANGEROUS_PATTERNS entries target the
+    literal substituted form (e.g. ``kill $(pgrep ...)`` as a
+    self-termination structural signal) while others need the expanded
+    form. ``detect_dangerous_command`` matches against both.
     """
     from tools.ansi_strip import strip_ansi
 
@@ -184,17 +228,64 @@ def _normalize_command_for_detection(command: str) -> str:
     return command
 
 
+def _expand_shell_obfuscations(command: str) -> str:
+    """Reverse shell-tokenization obfuscations that would defeat literal-string
+    regex matching: empty quote pairs, quoted identifier tokens, ``${IFS}``
+    expansion, ``$'\\xNN'`` ANSI-C quoting, and ``$(cmd)`` / backtick
+    command substitution.
+
+    The shell strips/substitutes these at tokenize time, so a regex that
+    matches ``rm`` against the literal string ``r""m`` or ``rm${IFS}-rf``
+    will miss them — the shell nonetheless executes ``rm``. We apply the
+    same transform here so detection sees what the shell will see.
+
+    This pass is complementary to ``_normalize_command_for_detection`` —
+    ``detect_dangerous_command`` matches against both.
+    """
+    # Empty quote pairs (r""m, f''oo) collapse to nothing at tokenize time.
+    command = _EMPTY_QUOTE_RE.sub('', command)
+    # ${IFS} / $IFS expands to whitespace. Use a single space — sufficient
+    # for \b word-boundary matches in DANGEROUS_PATTERNS.
+    command = _IFS_EXPANSION_RE.sub(' ', command)
+    # $'...' ANSI-C quoting: decode \xNN so `$'\x72\x6d' -rf` resolves to `rm -rf`
+    command = _ANSI_C_QUOTE_RE.sub(lambda m: _decode_ansi_c_body(m.group(1)), command)
+    # $(cmd args) / `cmd args` command substitution: inline the inner body so
+    # the outer command's name becomes visible to the regex. Loop to cover
+    # nesting, with a small bound to prevent pathological input from running
+    # unboundedly.
+    for _ in range(4):
+        new = _CMD_SUBST_RE.sub(lambda m: ' ' + m.group(1) + ' ', command)
+        new = _BACKTICK_SUBST_RE.sub(lambda m: ' ' + m.group(1) + ' ', new)
+        if new == command:
+            break
+        command = new
+    # Quoted identifier tokens (shell strips the quotes at tokenize time).
+    # Run AFTER command substitution so the inlined bodies also get unquoted.
+    command = _QUOTED_IDENT_RE.sub(lambda m: m.group(1) or m.group(2), command)
+    return command
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
+
+    Matches against BOTH the base-normalized form (preserves literal
+    ``$(...)`` / backtick / ``${IFS}`` so structural patterns like
+    ``kill $(pgrep ...)`` still fire) AND the expanded form (so that
+    obfuscations like ``r""m -rf`` or ``$(echo rm) -rf`` also fire via
+    the inner command name).
 
     Returns:
         (is_dangerous, pattern_key, description) or (False, None, None)
     """
-    command_lower = _normalize_command_for_detection(command).lower()
+    base = _normalize_command_for_detection(command).lower()
+    expanded = _expand_shell_obfuscations(base)
     for pattern, description in DANGEROUS_PATTERNS:
-        if re.search(pattern, command_lower, re.IGNORECASE | re.DOTALL):
-            pattern_key = description
-            return (True, pattern_key, description)
+        if re.search(pattern, base, re.IGNORECASE | re.DOTALL):
+            return (True, description, description)
+        if expanded != base and re.search(
+            pattern, expanded, re.IGNORECASE | re.DOTALL
+        ):
+            return (True, description, description)
     return (False, None, None)
 
 

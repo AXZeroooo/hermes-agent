@@ -837,3 +837,126 @@ class TestChmodExecuteCombo:
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is False
 
+
+class TestShellTokenizationBypass:
+    """Advisories GHSA-xvmp-c27r-qw3c and GHSA-pwx6-3q74-cxwr reported four
+    shell-tokenization tricks that bypass the literal-string regex layer.
+    ``_expand_shell_obfuscations`` reverses each of them so the underlying
+    command name becomes visible to ``DANGEROUS_PATTERNS``.
+    """
+
+    # --- empty-quote pair bypass -----------------------------------------
+
+    def test_empty_double_quote_pair_bypass_detected(self):
+        cmd = 'r""m -rf /tmp/foo'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_empty_single_quote_pair_bypass_detected(self):
+        cmd = "r''m -rf /tmp/foo"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    # --- ${IFS} / $IFS expansion bypass -----------------------------------
+
+    def test_ifs_brace_expansion_bypass_detected(self):
+        cmd = 'rm${IFS}-rf${IFS}/tmp/foo'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_ifs_bare_expansion_bypass_detected(self):
+        cmd = 'rm$IFS-rf$IFS/tmp/foo'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_ifs_chmod_bypass_detected(self):
+        cmd = 'chmod${IFS}777${IFS}/etc/shadow'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    # --- $(...) / backtick command substitution bypass -------------------
+
+    def test_cmd_subst_script_exec_bypass_detected(self):
+        cmd = "$(echo python3) -c 'print(1)'"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_cmd_subst_quoted_identifier_bypass_detected(self):
+        cmd = "$(echo 'rm') -rf /tmp/foo"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_cmd_subst_double_quoted_identifier_bypass_detected(self):
+        cmd = '$(echo "rm") -rf /tmp/foo'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_backtick_substitution_bypass_detected(self):
+        cmd = '`echo rm` -rf /tmp/foo'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_nested_cmd_substitution_bypass_detected(self):
+        cmd = '$(echo $(echo rm)) -rf /tmp/foo'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_cmd_subst_git_destructive_bypass_detected(self):
+        cmd = "$(echo 'git') reset --hard HEAD"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    # --- ANSI-C quoting bypass --------------------------------------------
+
+    def test_ansi_c_quote_hex_bypass_detected(self):
+        # $'\x72\x6d' = 'rm'
+        cmd = "$'\\x72\\x6d' -rf /tmp/foo"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_ansi_c_quote_plus_ifs_combined_bypass_detected(self):
+        cmd = "$'\\x72\\x6d'${IFS}-rf${IFS}/tmp"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    # --- legitimate commands MUST NOT false-positive --------------------
+
+    def test_quoted_log_message_with_rm_not_flagged(self):
+        """A quoted string containing 'rm' as a word should not trigger."""
+        cmd = 'echo "this is a message mentioning rm here"'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_grep_with_quoted_pattern_not_flagged(self):
+        cmd = "grep 'pattern' file.txt"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_commit_with_quoted_message_not_flagged(self):
+        cmd = "git commit -m 'fix: update'"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_curl_with_quoted_header_not_flagged(self):
+        cmd = 'curl -H "Content-Type: application/json" https://api.example.com'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_echo_with_variable_expansion_not_flagged(self):
+        """Variable expansion that isn't ${IFS} must not be substituted."""
+        cmd = 'echo ${PATH}'
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    # --- regression: structural patterns still fire on literal form ------
+
+    def test_structural_pgrep_still_detected(self):
+        """kill $(pgrep ...) must still match the literal structural pattern —
+        this relies on the base-normalized form still containing $(, not just
+        the expanded form.
+        """
+        cmd = 'kill -9 $(pgrep -f "hermes.*gateway")'
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "pgrep" in desc.lower()
+
