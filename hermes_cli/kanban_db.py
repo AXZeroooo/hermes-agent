@@ -6275,6 +6275,13 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    Source states: ``running``, ``ready`` and ``todo``. ``todo`` is included so
+    an operator can stop a card that is merely queued — previously the only way
+    to stop queued work was to wait for it to become ``ready`` (i.e. race the
+    dispatcher) or archive the card, which destroys the audit trail. A
+    ``dependency`` block on a ``todo`` card is a no-op success: the card is
+    already waiting exactly where a dependency wait belongs.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -6293,8 +6300,14 @@ def block_task(
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
-            else "ready"
+            else cur_row["status"]
         )
+
+        # A dependency wait on a card already parked in ``todo`` is where it
+        # should be. Report success without churning state or emitting a
+        # spurious lifecycle event.
+        if kind == "dependency" and cur_row["status"] == "todo":
+            return True
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -6317,7 +6330,7 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'todo')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, task_id) if expected_run_id is None
                 else (kind, task_id, int(expected_run_id)),
@@ -6375,7 +6388,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'todo')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -6414,7 +6427,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'todo')
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -6429,7 +6442,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'todo')
                        AND current_run_id = ?
                     """,
                     (kind, recurrences, task_id, int(expected_run_id)),
