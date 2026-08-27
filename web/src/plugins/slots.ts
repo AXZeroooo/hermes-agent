@@ -18,7 +18,9 @@ import React, { Fragment, useEffect, useState } from "react";
 /** Slot locations the built-in shell renders. Plugins declaring any of
  *  these in their manifest's `slots` field get wired in automatically.
  *
- *  - `backdrop`         — rendered inside `<Backdrop />`, above the noise layer
+ *  Shell-wide slots:
+ *  - `backdrop`         — optional full-viewport background decoration;
+ *                         mounted behind shell chrome at z-0
  *  - `header-left`      — injected before the Hermes brand in the top bar
  *  - `header-right`     — injected before the theme/language switchers
  *  - `header-banner`    — injected below the top nav bar, full-width
@@ -31,8 +33,33 @@ import React, { Fragment, useEffect, useState } from "react";
  *  - `overlay`          — fixed-position layer above everything else;
  *                         useful for chrome (scanlines, vignettes) the
  *                         theme's customCSS can't achieve alone
+ *
+ *  Page-scoped slots (rendered inside a specific built-in page — use these
+ *  to inject widgets, cards, or toolbars into existing pages without
+ *  overriding the whole route):
+ *  - `sessions:top`     — top of /sessions page (above session list)
+ *  - `sessions:bottom`  — bottom of /sessions page
+ *  - `analytics:top`    — top of /analytics page
+ *  - `analytics:bottom` — bottom of /analytics page
+ *  - `logs:top`         — top of /logs page (above filter toolbar)
+ *  - `logs:bottom`      — bottom of /logs page (below log viewer)
+ *  - `cron:top`         — top of /cron page
+ *  - `cron:bottom`      — bottom of /cron page
+ *  - `skills:top`       — top of /skills page
+ *  - `skills:bottom`    — bottom of /skills page
+ *  - `plugins:top`       — top of /plugins page
+ *  - `plugins:bottom`    — bottom of /plugins page
+ *  - `config:top`       — top of /config page
+ *  - `config:bottom`    — bottom of /config page
+ *  - `env:top`          — top of /env (Keys) page
+ *  - `env:bottom`       — bottom of /env (Keys) page
+ *  - `docs:top`         — top of /docs page (above the docs iframe)
+ *  - `docs:bottom`      — bottom of /docs page
+ *  - `chat:top`         — top of /chat page (above the composer, when embedded chat is on)
+ *  - `chat:bottom`      — bottom of /chat page
  */
 export const KNOWN_SLOT_NAMES = [
+  // Shell-wide
   "backdrop",
   "header-left",
   "header-right",
@@ -43,6 +70,27 @@ export const KNOWN_SLOT_NAMES = [
   "footer-left",
   "footer-right",
   "overlay",
+  // Page-scoped
+  "sessions:top",
+  "sessions:bottom",
+  "analytics:top",
+  "analytics:bottom",
+  "logs:top",
+  "logs:bottom",
+  "cron:top",
+  "cron:bottom",
+  "skills:top",
+  "skills:bottom",
+  "plugins:top",
+  "plugins:bottom",
+  "config:top",
+  "config:bottom",
+  "env:top",
+  "env:bottom",
+  "docs:top",
+  "docs:bottom",
+  "chat:top",
+  "chat:bottom",
 ] as const;
 
 export type KnownSlotName = (typeof KNOWN_SLOT_NAMES)[number];

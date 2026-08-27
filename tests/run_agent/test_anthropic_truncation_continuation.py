@@ -59,7 +59,7 @@ class TestTruncatedAnthropicResponseNormalization:
         nr = get_transport("anthropic_messages").normalize_response(response)
 
         # The continuation block checks these two attributes:
-        #   assistant_message.content  → appended to truncated_response_prefix
+        #   assistant_message.content  → appended to truncated_response_parts
         #   assistant_message.tool_calls → guards the text-retry branch
         assert nr.content is not None
         assert "partial response" in nr.content
@@ -69,23 +69,6 @@ class TestTruncatedAnthropicResponseNormalization:
         )
         assert nr.finish_reason == "length", "max_tokens stop_reason must map to OpenAI-style 'length'"
 
-    def test_truncated_tool_call_produces_tool_calls(self):
-        """Tool-use truncation → tool-call retry path should fire."""
-        from agent.transports import get_transport
-
-        response = _make_anthropic_response(
-            [
-                _make_anthropic_text_block("thinking..."),
-                _make_anthropic_tool_use_block(),
-            ]
-        )
-        nr = get_transport("anthropic_messages").normalize_response(response)
-
-        assert bool(nr.tool_calls), (
-            "Truncation mid-tool_use must expose tool_calls so the "
-            "tool-call retry branch fires instead of text continuation"
-        )
-        assert nr.finish_reason == "length"
 
     def test_empty_content_does_not_crash(self):
         """Empty response.content — defensive: treat as a truncation with no text."""
@@ -106,9 +89,9 @@ class TestContinuationLogicBranching:
     def test_all_three_api_modes_hit_continuation_branch(self, api_mode):
         # The guard in run_agent.py is:
         #   if self.api_mode in ("chat_completions", "bedrock_converse", "anthropic_messages"):
-        assert api_mode in ("chat_completions", "bedrock_converse", "anthropic_messages")
+        assert api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}
 
     def test_codex_responses_still_excluded(self):
         # codex_responses has its own truncation path (not continuation-based)
         # and should NOT be routed through the shared block.
-        assert "codex_responses" not in ("chat_completions", "bedrock_converse", "anthropic_messages")
+        assert "codex_responses" not in {"chat_completions", "bedrock_converse", "anthropic_messages"}

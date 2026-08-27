@@ -1,14 +1,14 @@
 ---
-title: "Huggingface Hub"
+title: "Huggingface Hub — HuggingFace hf CLI: search/download/upload models, datasets"
 sidebar_label: "Huggingface Hub"
-description: "Hugging Face Hub CLI (hf) — search, download, and upload models and datasets, manage repos, query datasets with SQL, deploy inference endpoints, manage Space..."
+description: "HuggingFace hf CLI: search/download/upload models, datasets"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Huggingface Hub
 
-Hugging Face Hub CLI (hf) — search, download, and upload models and datasets, manage repos, query datasets with SQL, deploy inference endpoints, manage Spaces and buckets.
+HuggingFace hf CLI: search/download/upload models, datasets.
 
 ## Skill metadata
 
@@ -16,9 +16,10 @@ Hugging Face Hub CLI (hf) — search, download, and upload models and datasets, 
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/mlops/huggingface-hub` |
-| Version | `1.0.0` |
+| Version | `1.0.1` |
 | Author | Hugging Face |
 | License | MIT |
+| Platforms | linux, macos, windows |
 
 ## Reference: full SKILL.md
 
@@ -43,8 +44,8 @@ The `hf` command is the modern command-line interface for interacting with the H
 
 ### General Operations
 *   `hf download REPO_ID`: Download files from the Hub.
-*   `hf upload REPO_ID`: Upload files/folders (recommended for single-commit).
-*   `hf upload-large-folder REPO_ID LOCAL_PATH`: Recommended for resumable uploads of large directories.
+*   `hf upload REPO_ID`: Upload files/folders (recommended for single-commit; also handles resumable uploads of large directories).
+*   `hf upload-large-folder REPO_ID LOCAL_PATH`: **[Deprecated]** — use `hf upload` instead.
 *   `hf sync`: Sync files between a local directory and a bucket.
 *   `hf env` / `hf version`: View environment and version details.
 
@@ -68,7 +69,7 @@ The `hf` command is the modern command-line interface for interacting with the H
 *   **Datasets:** `hf datasets list`, `info`, and `parquet` (list parquet URLs).
 *   **SQL Queries:** `hf datasets sql SQL` — Execute raw SQL via DuckDB against dataset parquet URLs.
 *   **Models:** `hf models list` and `info`.
-*   **Papers:** `hf papers list` — View daily papers.
+*   **Papers:** `hf papers ls` — View daily papers.
 
 ### Discussions & Pull Requests (`hf discussions`)
 *   Manage the lifecycle of Hub contributions: `list`, `create`, `info`, `comment`, `close`, `reopen`, and `rename`.

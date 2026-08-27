@@ -19,8 +19,18 @@ Two files make up the agent's memory:
 
 Both are stored in `~/.hermes/memories/` and are injected into the system prompt as a frozen snapshot at session start. The agent manages its own memory via the `memory` tool — it can add, replace, or remove entries.
 
+:::caution One agent per Hermes home
+Don't point two agent processes at the same Hermes home directory. Memory writes are automatic and load back into the system prompt at session start, so two writers sharing one home will compound each other's entries into state neither of them (nor you) authored. Memory is scoped per [profile](/user-guide/profiles) by design — give a second agent its own profile, and if they need shared memory, use an [external memory provider](/user-guide/features/memory-providers) instead.
+:::
+
 :::info
-Character limits keep memory focused. When memory is full, the agent consolidates or replaces entries to make room for new information.
+Character limits keep memory focused. Memory does **not** auto-compact: when a
+write would exceed the limit, the `memory` tool returns an error instead of
+silently dropping entries. The agent then makes room itself — consolidating or
+removing entries in the same turn before retrying (see [What Happens When Memory
+is Full](#what-happens-when-memory-is-full)). Note that `replace` is also bound
+by the limit: swapping an entry for a longer one can still overflow, so the new
+content must be shortened (or another entry removed) to fit.
 :::
 
 ## How Memory Appears in the System Prompt
@@ -128,7 +138,7 @@ When you try to add an entry that would exceed the limit, the tool returns an er
 ```json
 {
   "success": false,
-  "error": "Memory at 2,100/2,200 chars. Adding this entry (250 chars) would exceed the limit. Replace or remove existing entries first.",
+  "error": "Memory at 2,100/2,200 chars. Adding this entry (250 chars) would exceed the limit. Consolidate now: use 'replace' to merge overlapping entries into shorter ones or 'remove' stale or less important entries (see current_entries below), then retry this add — all in this turn.",
   "current_entries": ["..."],
   "usage": "2,100/2,200"
 }
@@ -177,24 +187,46 @@ Memory entries are scanned for injection and exfiltration patterns before being 
 Beyond MEMORY.md and USER.md, the agent can search its past conversations using the `session_search` tool:
 
 - All CLI and messaging sessions are stored in SQLite (`~/.hermes/state.db`) with FTS5 full-text search
-- Search queries return relevant past conversations with Gemini Flash summarization
+- Search queries return actual messages from the DB — no LLM summarization, no truncation
 - The agent can find things it discussed weeks ago, even if they're not in its active memory
+- The agent can also scroll forward/backward inside any session it finds
 
 ```bash
 hermes sessions list    # Browse past sessions
 ```
+
+See [Session Search Tool](/user-guide/sessions#session-search-tool) for the three calling shapes (discovery / scroll / browse) and the response format.
 
 ### session_search vs memory
 
 | Feature | Persistent Memory | Session Search |
 |---------|------------------|----------------|
 | **Capacity** | ~1,300 tokens total | Unlimited (all sessions) |
-| **Speed** | Instant (in system prompt) | Requires search + LLM summarization |
+| **Speed** | Instant (in system prompt) | ~20ms FTS5 query, ~1ms scroll |
+| **Cost** | Token cost in every prompt | Free — no LLM calls |
 | **Use case** | Key facts always available | Finding specific past conversations |
 | **Management** | Manually curated by agent | Automatic — all sessions stored |
 | **Token cost** | Fixed per session (~1,300 tokens) | On-demand (searched when needed) |
 
 **Memory** is for critical facts that should always be in context. **Session search** is for "did we discuss X last week?" queries where the agent needs to recall specifics from past conversations.
+
+## Learning Journey (`/journey`)
+
+The learning journey is a timeline view of everything Hermes has learned — saved skills and memory entries plotted over time (oldest at top, newest at bottom), with a playable "constellation" scrubber that replays the build-up. The same graph data drives three surfaces:
+
+- **Classic CLI / standalone** — `hermes journey` (aliases: `hermes learning`, `hermes memory-graph`) renders the timeline in the terminal. Flags: `--play` animates the build-up (`--fps` to tune it), `--width`/`--height` override the render size, `--no-color` disables color, and `--json` dumps the raw graph payload.
+- **TUI** — `/journey` (aliases: `/learning`, `/memory-graph`) opens the timeline as an overlay.
+- **Desktop app** — `/journey` opens the Star Map / memory-graph panel, an interactive visual of the same nodes.
+
+Beyond viewing, the journey is also where you **prune and correct** what Hermes has learned:
+
+| Command | What it does |
+|---------|--------------|
+| `hermes journey list` | List node ids — skill names and `memory:<source>:<index>` ids for memory chunks. |
+| `hermes journey delete <node> [-y]` | Delete a node. Skills are **archived** (restorable), memory chunks are removed. `-y` skips the confirmation. |
+| `hermes journey edit <node>` | Open the node's content (a skill's `SKILL.md` or the memory chunk) in `$EDITOR`. |
+
+The same `list` / `delete <id>` / `edit <id>` subcommands work from the in-chat `/journey` command on the CLI, and the desktop panel offers edit/delete on nodes directly.
 
 ## Configuration
 
@@ -205,7 +237,146 @@ memory:
   user_profile_enabled: true
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
+  write_approval: false     # false = write freely (default) | true = require approval
 ```
+
+Setting **both** `memory_enabled` and `user_profile_enabled` to `false` turns the
+built-in stores off completely: the `memory` tool is dropped from the schema and
+its guidance block is dropped from the system prompt, so the model is never told
+about a tool it cannot use. An external provider set via `memory.provider`
+(Hindsight, Mem0, Honcho, …) is unaffected and keeps its own tools — use this
+when you want a third-party memory backend *instead of* the built-in files.
+Listing `memory` under `agent.disabled_toolsets` is the heavier switch: it hides
+external provider tools too.
+
+With only `memory_enabled: false` (user profile still on), the tool stays —
+it backs the profile store — but the system prompt swaps the full memory
+guidance for a narrower profile-only block. The tool schema advertises only the
+`user` target, and direct or staged writes to disabled `MEMORY.md` are rejected.
+The inverse configuration advertises only `memory` and rejects `USER.md` writes.
+
+## Controlling memory writes (`write_approval`)
+
+By default the agent saves memory freely — including from the background
+self-improvement review that runs after a turn. If you'd rather approve saves
+first, set `memory.write_approval: true`. It's a simple on/off gate applied to
+**both** foreground turns and the background review:
+
+| `write_approval` | Behaviour |
+|------------------|-----------|
+| `false` (default) | Write freely — the gate is off (the pre-gate behaviour). |
+| `true` | Require approval before anything is saved. In the interactive CLI, foreground writes prompt you inline (entries are small enough to read in full). Everywhere else — messaging platforms, scripts, and the background self-improvement review — writes are **staged** for review with `/memory pending`. |
+
+> To turn memory off entirely (not just gate it), set both `memory_enabled: false` and `user_profile_enabled: false`. When both built-in stores are disabled, the built-in `memory` tool is automatically hidden.
+
+Review staged writes from the CLI or any messaging platform:
+
+```
+/memory pending             # list staged memory writes (auto ones tagged [auto])
+/memory approve <id>        # apply one (or 'all')
+/memory reject <id>         # drop one (or 'all')
+/memory approval on         # turn the gate on (or 'off') and persist it
+```
+
+This is the answer to "the agent saved a wrong assumption about me": set
+`write_approval: true`, and every save — especially the unprompted background
+ones — waits for your yes/no before it ever enters your profile.
+
+## Background review notifications (`display.memory_notifications`)
+
+After a turn, the background self-improvement review may quietly save a memory
+or update a skill. This is Hermes' consent-aware learning loop: repeated
+corrections and durable workflow lessons become compact memory entries or
+procedural skills, while `write_approval` can stage those writes for review
+before they affect future sessions. By default it surfaces a short
+`💾 Memory updated` line in chat so you know it happened. Control how chatty
+that is:
+
+```yaml
+display:
+  memory_notifications: on    # off | on (default) | verbose
+```
+
+| Value | Behaviour |
+|-------|-----------|
+| `off` | No chat notification. The review still runs and still writes — you just don't see a line for it. |
+| `on` (default) | Generic line, e.g. `💾 Memory updated`, `💾 Skill 'foo' patched`. |
+| `verbose` | Includes a compact preview of what changed, e.g. `💾 Memory ➕ User prefers terse replies` or a `"old" → "new"` skill diff snippet. |
+
+> This only governs the **gateway** chat notification. The review itself, and
+> writes to your memory/skill stores, are unaffected by this setting. Set it
+> per-platform via `display.platforms.<platform>.memory_notifications`.
+
+## Running the review on a cheaper model (`auxiliary.background_review`)
+
+The review runs on your **main chat model** by default, replaying the
+conversation — which is already warm in the prompt cache, so it's cheap cache
+reads. On an expensive main model you can run the review on a cheaper model
+instead:
+
+```yaml
+auxiliary:
+  background_review:
+    provider: openrouter
+    model: google/gemini-3-flash-preview   # auto (default) = main chat model
+```
+
+When you point it at a model **different** from your main one, the review runs
+there for substantially lower cost (~3–5× in benchmarks). Because a different
+model can't reuse your main model's prompt cache anyway, the fork automatically
+replays a compact **digest** of the conversation (recent turns verbatim + a
+summary of older ones) rather than the full transcript — minimizing what it
+writes to the new cache. Capture holds: in testing, memory capture was
+identical and skill capture near-identical to the main-model review.
+
+Leave it at `auto` (or set it to your main model) and nothing changes — the
+review keeps running on the main model with the full warm-cache replay.
+
+### Disabling automatic reviews (`enabled`)
+
+The review fork can burn a meaningful share of total tokens on busy hosts.
+Operators can disable it without zeroing nudge intervals:
+
+```yaml
+auxiliary:
+  background_review:
+    enabled: true              # false = skip automatic post-turn forks
+```
+
+With `enabled: false`, automatic post-turn forks do not spawn; manual
+`/refine` still works.
+
+Fork usage is persisted in `session_model_usage` with `task='background_review'`
+and a completion line is written to `agent.log`
+(`Background review complete: thread=bg-review calls=… in=… out=… result=…`).
+
+## Controlling skill writes (`skills.write_approval`)
+
+Skills use the same on/off gate, but the review UX differs because a
+`SKILL.md` is far too large to read in a chat bubble:
+
+```yaml
+skills:
+  write_approval: false     # false = write freely (default) | true = require approval
+```
+
+When `write_approval: true`, skill writes (create / edit / patch / write_file /
+delete) always **stage** regardless of origin. You review the one-line gist
+inline, but the full diff stays out-of-band:
+
+```
+/skills pending             # list staged skill writes + a one-line gist each
+/skills diff <id>           # full unified diff (best viewed in CLI or dashboard)
+/skills approve <id>        # apply it (or 'all')
+/skills reject <id>         # drop it (or 'all')
+/skills approval on         # turn the gate on (or 'off') and persist it
+```
+
+On a messaging platform, approve a skill from its gist + metadata, or open
+`/skills diff` on the CLI / dashboard / the staged file under
+`~/.hermes/pending/skills/<id>.json` when you want to read the whole change.
+Full details in [Gating agent skill writes](/user-guide/features/skills#gating-agent-skill-writes-skillswrite_approval).
+
 
 ## External Memory Providers
 

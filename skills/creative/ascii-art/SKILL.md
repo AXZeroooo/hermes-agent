@@ -1,10 +1,11 @@
 ---
 name: ascii-art
-description: Generate ASCII art using pyfiglet (571 fonts), cowsay, boxes, toilet, image-to-ascii, remote APIs (asciified, ascii.co.uk), and LLM fallback. No API keys required.
+description: "ASCII art: pyfiglet, cowsay, boxes, image-to-ascii."
 version: 4.0.0
 author: 0xbyt4, Hermes Agent
 license: MIT
 dependencies: []
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [ASCII, Art, Banners, Creative, Unicode, Text-Art, pyfiglet, figlet, cowsay, boxes]
@@ -29,9 +30,9 @@ pip install pyfiglet --break-system-packages -q
 ### Usage
 
 ```bash
-python3 -m pyfiglet "YOUR TEXT" -f slant
-python3 -m pyfiglet "TEXT" -f doom -w 80    # Set width
-python3 -m pyfiglet --list_fonts             # List all 571 fonts
+python -m pyfiglet "YOUR TEXT" -f slant
+python -m pyfiglet "TEXT" -f doom -w 80    # Set width
+python -m pyfiglet --list_fonts             # List all 571 fonts
 ```
 
 ### Recommended fonts
@@ -155,7 +156,7 @@ boxes -l                                       # List all 70+ designs
 ### Combine with pyfiglet or asciified
 
 ```bash
-python3 -m pyfiglet "HERMES" -f slant | boxes -d stone
+python -m pyfiglet "HERMES" -f slant | boxes -d stone
 # Or without pyfiglet installed:
 curl -s "https://asciified.thelicato.io/api/v2/ascii?text=HERMES&font=Slant" | boxes -d stone
 ```

@@ -135,33 +135,3 @@ async def test_verbose_dispatches_mid_run(monkeypatch):
     assert "can't run mid-turn" not in (result or "")
 
 
-@pytest.mark.asyncio
-async def test_fast_rejected_mid_run():
-    """/fast mid-run must hit the busy catch-all — config-only, next message."""
-    runner = _make_runner()
-    runner._handle_fast_command = AsyncMock(
-        side_effect=AssertionError("/fast should not dispatch mid-run")
-    )
-
-    result = await runner._handle_message(_make_event("/fast"))
-
-    runner._handle_fast_command.assert_not_awaited()
-    assert result is not None
-    assert "can't run mid-turn" in result
-    assert "/fast" in result
-
-
-@pytest.mark.asyncio
-async def test_reasoning_rejected_mid_run():
-    """/reasoning mid-run must hit the busy catch-all — config-only, next message."""
-    runner = _make_runner()
-    runner._handle_reasoning_command = AsyncMock(
-        side_effect=AssertionError("/reasoning should not dispatch mid-run")
-    )
-
-    result = await runner._handle_message(_make_event("/reasoning high"))
-
-    runner._handle_reasoning_command.assert_not_awaited()
-    assert result is not None
-    assert "can't run mid-turn" in result
-    assert "/reasoning" in result

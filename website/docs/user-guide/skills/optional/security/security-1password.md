@@ -1,14 +1,14 @@
 ---
-title: "1Password — Set up and use 1Password CLI (op)"
+title: "1Password — Set up op CLI, sign in, and read or inject secrets"
 sidebar_label: "1Password"
-description: "Set up and use 1Password CLI (op)"
+description: "Set up op CLI, sign in, and read or inject secrets"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # 1Password
 
-Set up and use 1Password CLI (op). Use when installing the CLI, enabling desktop app integration, signing in, and reading/injecting secrets for commands.
+Set up op CLI, sign in, and read or inject secrets.
 
 ## Skill metadata
 
@@ -19,6 +19,7 @@ Set up and use 1Password CLI (op). Use when installing the CLI, enabling desktop
 | Version | `1.0.0` |
 | Author | arceus77-7, enhanced by Hermes Agent |
 | License | MIT |
+| Platforms | linux, macos, windows |
 | Tags | `security`, `secrets`, `1password`, `op`, `cli` |
 
 ## Reference: full SKILL.md
@@ -50,7 +51,7 @@ Use this skill when the user wants secrets managed through 1Password instead of 
 
 ### Service Account (recommended for Hermes)
 
-Set `OP_SERVICE_ACCOUNT_TOKEN` in `~/.hermes/.env` (the skill will prompt for this on first load).
+Set `OP_SERVICE_ACCOUNT_TOKEN` in `${HERMES_HOME:-~/.hermes}/.env` (the skill will prompt for this on first load).
 No desktop app needed. Supports `op read`, `op inject`, `op run`.
 
 ```bash

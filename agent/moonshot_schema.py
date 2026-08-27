@@ -15,6 +15,9 @@ and MoonshotAI/kimi-cli#1595:
 2. When ``anyOf`` is used, ``type`` must be on the ``anyOf`` children, not
    the parent.  Presence of both causes "type should be defined in anyOf
    items instead of the parent schema".
+3. Every object schema must carry a ``required`` array, even an empty one.
+   Standard JSON Schema allows omitting it; Moonshot 400s with
+   "required must be an array".
 
 The ``#/definitions/...`` → ``#/$defs/...`` rewrite for draft-07 refs is
 handled separately in ``tools/mcp_tool._normalize_mcp_input_schema`` so it
@@ -81,20 +84,91 @@ def _repair_schema(node: Any, is_schema: bool = True) -> Any:
         return repaired
 
     # Rule 2: when anyOf is present, type belongs only on the children.
+    # Additionally, Moonshot rejects null-type branches inside anyOf
+    # (enum value (<nil>) does not match any type in [string]).
+    # Collapse the anyOf to the first non-null branch and infer its type.
     if "anyOf" in repaired and isinstance(repaired["anyOf"], list):
         repaired.pop("type", None)
-        return repaired
+        non_null = [b for b in repaired["anyOf"]
+                    if isinstance(b, dict) and b.get("type") != "null"]
+        if non_null and len(non_null) < len(repaired["anyOf"]):
+            # Drop the anyOf wrapper — keep only the non-null branch.
+            # If there's a single non-null branch, promote it and fall
+            # through to Rules 1/3 so nullable/enum cleanup still applies
+            # to the merged node.
+            if len(non_null) == 1:
+                merge = {k: v for k, v in repaired.items() if k != "anyOf"}
+                merge.update(non_null[0])
+                repaired = merge
+            else:
+                repaired["anyOf"] = non_null
+                return repaired
+        else:
+            # Nothing to collapse — parent type stripped, children already
+            # repaired by the recursive walk above.
+            return repaired
+
+    # Moonshot also rejects non-standard keywords like ``nullable`` on
+    # parameter schemas — strip it.
+    repaired.pop("nullable", None)
 
     # Rule 1: property schemas without type need one.  $ref nodes are exempt
     # — their type comes from the referenced definition.
-    if "$ref" in repaired:
-        return repaired
-    return _fill_missing_type(repaired)
+    # Fill missing type BEFORE Rule 3 so enum cleanup can check the type.
+    if "$ref" not in repaired:
+        repaired = _fill_missing_type(repaired)
+
+    # Rule 3: Moonshot rejects null/empty-string values inside enum arrays
+    # when the parent type is a scalar (string, integer, etc.).  The error:
+    #   "enum value (<nil>) does not match any type in [string]"
+    # Strip null and empty-string from enum values, and if the enum becomes
+    # empty, drop it entirely.
+    if "enum" in repaired and isinstance(repaired["enum"], list):
+        node_type = repaired.get("type")
+        if node_type in {"string", "integer", "number", "boolean"}:
+            cleaned = [v for v in repaired["enum"]
+                       if v is not None and v != ""]
+            if cleaned:
+                repaired["enum"] = cleaned
+            else:
+                repaired.pop("enum")
+
+    # Rule 4: object schemas must carry a `required` array, even when empty.
+    if repaired.get("type") == "object":
+        repaired = _ensure_required_array(repaired)
+
+    return repaired
+
+
+def _ensure_required_array(node: Dict[str, Any]) -> Dict[str, Any]:
+    """Guarantee an object schema carries a ``required`` array (Moonshot rule).
+
+    Standard JSON Schema lets you omit ``required`` when nothing is required;
+    Moonshot 400s on that ("required must be an array").  Ensure the key is a
+    list.  When ``properties`` is known, prune ``required`` entries that don't
+    name a real property — defensive against dangling names, which Moonshot
+    also rejects.  Mutates and returns ``node``.
+    """
+    props = node.get("properties")
+    req = node.get("required")
+    if isinstance(req, list):
+        if isinstance(props, dict):
+            node["required"] = [r for r in req if r in props]
+    else:
+        node["required"] = []
+    return node
 
 
 def _fill_missing_type(node: Dict[str, Any]) -> Dict[str, Any]:
     """Infer a reasonable ``type`` if this schema node has none."""
-    if "type" in node and node["type"] not in (None, ""):
+    node_type = node.get("type")
+    if isinstance(node_type, list):
+        concrete = next(
+            (t for t in node_type if isinstance(t, str) and t not in {"", "null"}),
+            "string",
+        )
+        return {**node, "type": concrete}
+    if "type" in node and node_type not in {None, ""}:
         return node
 
     # Heuristic: presence of ``properties`` → object, ``items`` → array, ``enum``
@@ -126,17 +200,18 @@ def sanitize_moonshot_tool_parameters(parameters: Any) -> Dict[str, Any]:
     applied.  Input is not mutated.
     """
     if not isinstance(parameters, dict):
-        return {"type": "object", "properties": {}}
+        return {"type": "object", "properties": {}, "required": []}
 
     repaired = _repair_schema(copy.deepcopy(parameters), is_schema=True)
     if not isinstance(repaired, dict):
-        return {"type": "object", "properties": {}}
+        return {"type": "object", "properties": {}, "required": []}
 
     # Top-level must be an object schema
     if repaired.get("type") != "object":
         repaired["type"] = "object"
     if "properties" not in repaired:
         repaired["properties"] = {}
+    _ensure_required_array(repaired)
 
     return repaired
 
@@ -183,6 +258,10 @@ def is_moonshot_model(model: str | None) -> bool:
     # Last path segment (covers aggregator-prefixed slugs)
     tail = bare.rsplit("/", 1)[-1]
     if tail.startswith("kimi-") or tail == "kimi":
+        return True
+    # Kimi Coding Plan serves K3 under the bare slug ``k3`` (plus dated /
+    # suffixed variants like ``k3.1`` or ``k3-turbo``).
+    if tail == "k3" or tail.startswith(("k3.", "k3-")):
         return True
     # Vendor-prefixed forms commonly used on aggregators
     if "moonshot" in bare or "/kimi" in bare or bare.startswith("kimi"):

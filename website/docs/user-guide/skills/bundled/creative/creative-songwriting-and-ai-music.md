@@ -1,14 +1,14 @@
 ---
-title: "Songwriting And Ai Music"
+title: "Songwriting And Ai Music — Songwriting craft and Suno AI music prompts"
 sidebar_label: "Songwriting And Ai Music"
-description: "Songwriting craft, AI music generation prompts (Suno focus), parody/adaptation techniques, phonetic tricks, and lessons learned"
+description: "Songwriting craft and Suno AI music prompts"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Songwriting And Ai Music
 
-Songwriting craft, AI music generation prompts (Suno focus), parody/adaptation techniques, phonetic tricks, and lessons learned. These are tools and ideas, not rules. Break any of them when the art calls for it.
+Songwriting craft and Suno AI music prompts.
 
 ## Skill metadata
 
@@ -16,6 +16,10 @@ Songwriting craft, AI music generation prompts (Suno focus), parody/adaptation t
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/creative/songwriting-and-ai-music` |
+| Version | `1.0.0` |
+| Author | Teknium (teknium1), Hermes Agent |
+| License | MIT |
+| Platforms | linux, macos, windows |
 
 ## Reference: full SKILL.md
 
@@ -295,3 +299,21 @@ Style can drift in extensions — restate genre/mood when extending.
 - Don't be precious about rules. If a line breaks meter but hits
   harder, keep it. The feeling is what matters. Craft serves art,
   not the other way around.
+
+---
+
+## 10. Local / Open-Source Music Generation
+
+For local, GPU-based generation instead of Suno, two optional skills
+cover this (heavy dependencies, so not installed by default):
+
+- **heartmula** — full songs with vocals from lyrics + tags
+  (open-source Suno alternative, 8-16GB VRAM):
+  `hermes skills install official/creative/heartmula`
+- **audiocraft** — Meta's MusicGen (instrumental text-to-music) and
+  AudioGen (sound effects):
+  `hermes skills install official/creative/audiocraft-audio-generation`
+
+The lyric-writing and prompting craft in this skill applies to
+heartmula too — its input format is lyrics with bracketed structure
+tags plus comma-separated style tags.

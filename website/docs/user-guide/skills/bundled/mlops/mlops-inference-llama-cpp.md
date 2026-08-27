@@ -1,7 +1,7 @@
 ---
-title: "Llama Cpp — llama"
+title: "Llama Cpp — llama.cpp local GGUF inference + HF Hub model discovery"
 sidebar_label: "Llama Cpp"
-description: "llama"
+description: "llama.cpp local GGUF inference + HF Hub model discovery"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
@@ -20,6 +20,7 @@ llama.cpp local GGUF inference + HF Hub model discovery.
 | Author | Orchestra Research |
 | License | MIT |
 | Dependencies | `llama-cpp-python>=0.2.0` |
+| Platforms | linux, macos, windows |
 | Tags | `llama.cpp`, `GGUF`, `Quantization`, `Hugging Face Hub`, `CPU Inference`, `Apple Silicon`, `Edge Deployment`, `AMD GPUs`, `Intel GPUs`, `NVIDIA`, `URL-first` |
 
 ## Reference: full SKILL.md

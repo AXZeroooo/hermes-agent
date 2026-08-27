@@ -1,14 +1,14 @@
 ---
-title: "Weights And Biases"
+title: "Weights And Biases — W&B: log ML experiments, sweeps, model registry, dashboards"
 sidebar_label: "Weights And Biases"
-description: "Track ML experiments with automatic logging, visualize training in real-time, optimize hyperparameters with sweeps, and manage model registry with W&B - coll..."
+description: "W&B: log ML experiments, sweeps, model registry, dashboards"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Weights And Biases
 
-Track ML experiments with automatic logging, visualize training in real-time, optimize hyperparameters with sweeps, and manage model registry with W&B - collaborative MLOps platform
+W&B: log ML experiments, sweeps, model registry, dashboards.
 
 ## Skill metadata
 
@@ -16,10 +16,11 @@ Track ML experiments with automatic logging, visualize training in real-time, op
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/mlops/evaluation/weights-and-biases` |
-| Version | `1.0.0` |
+| Version | `1.0.1` |
 | Author | Orchestra Research |
 | License | MIT |
 | Dependencies | `wandb` |
+| Platforms | linux, macos, windows |
 | Tags | `MLOps`, `Weights And Biases`, `WandB`, `Experiment Tracking`, `Hyperparameter Tuning`, `Model Registry`, `Collaboration`, `Real-Time Visualization`, `PyTorch`, `TensorFlow`, `HuggingFace` |
 
 ## Reference: full SKILL.md
@@ -254,7 +255,7 @@ sweep_config = {
     },
     'parameters': {
         'learning_rate': {
-            'distribution': 'log_uniform',
+            'distribution': 'log_uniform_values',
             'min': 1e-5,
             'max': 1e-1
         },
@@ -333,7 +334,7 @@ sweep_config = {
     'method': 'bayes',
     'metric': {'name': 'val/loss', 'goal': 'minimize'},
     'parameters': {
-        'lr': {'distribution': 'log_uniform', 'min': 1e-5, 'max': 1e-1}
+        'lr': {'distribution': 'log_uniform_values', 'min': 1e-5, 'max': 1e-1}
     }
 }
 ```
@@ -449,17 +450,21 @@ trainer.fit(model, datamodule=dm)
 
 ```python
 import wandb
-from wandb.keras import WandbCallback
+from wandb.integration.keras import WandbMetricsLogger, WandbModelCheckpoint
 
 # Initialize
 wandb.init(project="keras-demo")
 
-# Add callback
+# Add callbacks (the monolithic WandbCallback was removed;
+# use the dedicated callbacks from wandb.integration.keras instead)
 model.fit(
     x_train, y_train,
     validation_data=(x_val, y_val),
     epochs=10,
-    callbacks=[WandbCallback()]  # Auto-logs metrics
+    callbacks=[
+        WandbMetricsLogger(),                        # Auto-logs metrics
+        WandbModelCheckpoint("models/model-{epoch}")  # Saves checkpoints
+    ]
 )
 ```
 

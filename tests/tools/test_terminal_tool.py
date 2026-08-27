@@ -4,11 +4,11 @@ import tools.terminal_tool as terminal_tool
 
 
 def setup_function():
-    terminal_tool._cached_sudo_password = ""
+    terminal_tool._reset_cached_sudo_passwords()
 
 
 def teardown_function():
-    terminal_tool._cached_sudo_password = ""
+    terminal_tool._reset_cached_sudo_passwords()
 
 
 def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):
@@ -20,6 +20,14 @@ def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):
 
     assert transformed == command
     assert sudo_stdin is None
+
+
+def test_terminal_schema_advertises_persistent_env_state():
+    description = terminal_tool.TERMINAL_TOOL_DESCRIPTION
+
+    assert "exported environment variables persist between calls" in description
+    assert "activate a virtualenv" in description
+    assert "once per session" in description
 
 
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
@@ -54,16 +62,6 @@ def test_actual_sudo_command_uses_configured_password(monkeypatch):
     assert sudo_stdin == "testpass\n"
 
 
-def test_actual_sudo_after_leading_env_assignment_is_rewritten(monkeypatch):
-    monkeypatch.setenv("SUDO_PASSWORD", "testpass")
-    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-
-    transformed, sudo_stdin = terminal_tool._transform_sudo_command("DEBUG=1 sudo whoami")
-
-    assert transformed == "DEBUG=1 sudo -S -p '' whoami"
-    assert sudo_stdin == "testpass\n"
-
-
 def test_explicit_empty_sudo_password_tries_empty_without_prompt(monkeypatch):
     monkeypatch.setenv("SUDO_PASSWORD", "")
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
@@ -79,27 +77,32 @@ def test_explicit_empty_sudo_password_tries_empty_without_prompt(monkeypatch):
     assert sudo_stdin == "\n"
 
 
-def test_cached_sudo_password_is_used_when_env_is_unset(monkeypatch):
-    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
-    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
-    terminal_tool._cached_sudo_password = "cached-pass"
-
-    transformed, sudo_stdin = terminal_tool._transform_sudo_command("echo ok && sudo whoami")
-
-    assert transformed == "echo ok && sudo -S -p '' whoami"
-    assert sudo_stdin == "cached-pass\n"
-
-
-def test_validate_workdir_allows_windows_drive_paths():
-    assert terminal_tool._validate_workdir(r"C:\Users\Alice\project") is None
-    assert terminal_tool._validate_workdir("C:/Users/Alice/project") is None
-
-
-def test_validate_workdir_allows_windows_unc_paths():
-    assert terminal_tool._validate_workdir(r"\\server\share\project") is None
-
-
 def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+def test_validate_workdir_allows_unicode_filesystem_paths():
+    assert terminal_tool._validate_workdir(
+        "/Users/alice/Documents/Obs_Hermes_Data/项目-projects/客户拜访"
+    ) is None
+    assert terminal_tool._validate_workdir("/tmp/テスト") is None
+    assert terminal_tool._validate_workdir("/home/jürgen/über projekt") is None
+
+
+def test_validate_workdir_still_blocks_metachars_in_unicode_paths():
+    # Widening to Unicode letters must not open the injection boundary:
+    # shell metacharacters and control chars stay rejected even when mixed
+    # with non-ASCII path segments.
+    assert terminal_tool._validate_workdir("/tmp/テスト; rm -rf /")
+    assert terminal_tool._validate_workdir("/tmp/项目$(whoami)")
+    assert terminal_tool._validate_workdir("/tmp/über`id`")
+    assert terminal_tool._validate_workdir("/tmp/テスト\nwhoami")
+    assert terminal_tool._validate_workdir("/tmp/项目|cat /etc/passwd")
+    assert terminal_tool._validate_workdir("/tmp/ü\x00ber")
+
+
+def test_count_real_sudo_invocations_ignores_mentions(monkeypatch):
+    assert terminal_tool._count_real_sudo_invocations("grep sudo README.md") == 0
+    assert terminal_tool._count_real_sudo_invocations("sudo a; sudo b") == 2

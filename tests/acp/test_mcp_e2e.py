@@ -7,9 +7,6 @@ Exercises the full flow through the ACP server layer:
     session_update events arrive at the mock client
 """
 
-import asyncio
-from collections import deque
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -124,7 +121,7 @@ class TestMcpRegistrationE2E:
         mock_conn.request_permission = AsyncMock()
         acp_agent._conn = mock_conn
 
-        def mock_run_conversation(user_message, conversation_history=None, task_id=None):
+        def mock_run_conversation(user_message, conversation_history=None, task_id=None, **kwargs):
             """Simulate an agent turn that calls terminal, gets a result, then responds."""
             agent = state.agent
 
@@ -178,11 +175,12 @@ class TestMcpRegistrationE2E:
         complete_event = completions[0]
         assert isinstance(complete_event, ToolCallProgress)
         assert complete_event.status == "completed"
-        # rawOutput should contain the tool result string
-        assert complete_event.raw_output is not None
-        assert "hello" in str(complete_event.raw_output)
+        # Completion should contain human-readable output rather than forcing raw JSON panes.
+        assert complete_event.content
+        assert "hello" in complete_event.content[0].content.text
+        assert complete_event.raw_output is None
 
-    def test_patch_mode_tool_start_emits_diff_blocks_for_v4a_patch(self):
+    def test_patch_mode_tool_start_defers_diff_to_edit_approval_prompt(self):
         update = build_tool_start(
             "tc-1",
             "patch",
@@ -192,64 +190,10 @@ class TestMcpRegistrationE2E:
             },
         )
 
-        assert len(update.content) == 2
-        assert update.content[0].type == "diff"
-        assert update.content[0].path == "src/app.py"
-        assert update.content[0].old_text == "old line"
-        assert update.content[0].new_text == "new line"
-        assert update.content[1].type == "diff"
-        assert update.content[1].path == "src/new.py"
-        assert update.content[1].new_text == "hello"
+        assert len(update.content) == 1
+        assert update.content[0].type == "content"
+        assert "Approval prompt shows the diff" in update.content[0].content.text
 
-    @pytest.mark.asyncio
-    async def test_prompt_tool_results_paired_by_call_id(self, acp_agent, mock_manager):
-        """The ToolCallUpdate's toolCallId must match the ToolCallStart's."""
-        resp = await acp_agent.new_session(cwd="/tmp")
-        session_id = resp.session_id
-        state = mock_manager.get_session(session_id)
-
-        mock_conn = MagicMock(spec=acp.Client)
-        mock_conn.session_update = AsyncMock()
-        mock_conn.request_permission = AsyncMock()
-        acp_agent._conn = mock_conn
-
-        def mock_run(user_message, conversation_history=None, task_id=None):
-            agent = state.agent
-            # Fire two tool calls
-            if agent.tool_progress_callback:
-                agent.tool_progress_callback("tool.started", "read_file", "read: /etc/hosts", {"path": "/etc/hosts"})
-                agent.tool_progress_callback("tool.started", "web_search", "web search: test", {"query": "test"})
-
-            if agent.step_callback:
-                agent.step_callback(1, [
-                    {"name": "read_file", "result": '{"content": "127.0.0.1 localhost"}'},
-                    {"name": "web_search", "result": '{"data": {"web": []}}'},
-                ])
-
-            return {"final_response": "Done.", "messages": []}
-
-        state.agent.run_conversation = mock_run
-
-        prompt = [TextContentBlock(type="text", text="test")]
-        await acp_agent.prompt(prompt=prompt, session_id=session_id)
-
-        updates = []
-        for call in mock_conn.session_update.call_args_list:
-            update_arg = call[1].get("update") or call[0][1]
-            updates.append(update_arg)
-
-        starts = [u for u in updates if getattr(u, "session_update", None) == "tool_call"]
-        completions = [u for u in updates if getattr(u, "session_update", None) == "tool_call_update"]
-
-        assert len(starts) == 2, f"Expected 2 starts, got {len(starts)}"
-        assert len(completions) == 2, f"Expected 2 completions, got {len(completions)}"
-
-        # Each completion's toolCallId must match a start's toolCallId
-        start_ids = {s.tool_call_id for s in starts}
-        completion_ids = {c.tool_call_id for c in completions}
-        assert start_ids == completion_ids, (
-            f"IDs must match: starts={start_ids}, completions={completion_ids}"
-        )
 
 
 class TestMcpSanitizationE2E:

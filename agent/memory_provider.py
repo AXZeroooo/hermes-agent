@@ -1,17 +1,16 @@
 """Abstract base class for pluggable memory providers.
 
-Memory providers give the agent persistent recall across sessions. One
-external provider is active at a time alongside the always-on built-in
-memory (MEMORY.md / USER.md). The MemoryManager enforces this limit.
+Memory providers give the agent persistent recall across sessions.
+The MemoryManager enforces a one-external-provider limit to prevent
+tool schema bloat and conflicting memory backends.
 
-Built-in memory is always active as the first provider and cannot be removed.
-External providers (Honcho, Hindsight, Mem0, etc.) are additive — they never
-disable the built-in store. Only one external provider runs at a time to
-prevent tool schema bloat and conflicting memory backends.
+External providers (Honcho, Hindsight, Mem0, etc.) are registered
+and managed via MemoryManager. Only one external provider runs at a
+time.
 
 Registration:
-  1. Built-in: BuiltinMemoryProvider — always present, not removable.
-  2. Plugins: Ship in plugins/memory/<name>/, activated by memory.provider config.
+  Plugins ship in plugins/memory/<name>/ and are activated via
+  the memory.provider config key.
 
 Lifecycle (called by MemoryManager, wired in run_agent.py):
   initialize()          — connect, create resources, warm up
@@ -25,22 +24,97 @@ Lifecycle (called by MemoryManager, wired in run_agent.py):
 Optional hooks (override to opt in):
   on_turn_start(turn, message, **kwargs) — per-turn tick with runtime context
   on_session_end(messages)               — end-of-session extraction
+  on_session_switch(new_session_id, **kwargs) — mid-process session_id rotation
   on_pre_compress(messages) -> str       — extract before context compression
-  on_memory_write(action, target, content) — mirror built-in memory writes
+  on_memory_write(action, target, content, metadata=None) — mirror built-in memory writes
   on_delegation(task, result, **kwargs)  — parent-side observation of subagent work
+  backup_paths() -> list[str]            — extra on-disk paths to include in `hermes backup`
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Version 1 is the historical, implicit contract every provider is already
+# on: best-effort on_pre_compress() with the raw message list. Version 2 is
+# the opt-in fail-closed checkpoint contract (normalized evidence handoff +
+# strict-mode failure propagation).
+PRE_COMPRESS_CHECKPOINT_API_VERSION = 2
+
+# Default glyph for the deterministic memory indicators. Providers override
+# per-status with their own brand mark (e.g. Hindsight uses "👁️").
+INDICATOR_GLYPH = "🧠"
+
+
+@dataclass(frozen=True)
+class RecallStatus:
+    """Summary of what a provider's most recent prefetch injected this turn.
+
+    Returned by :meth:`MemoryProvider.recall_status` so the agent can emit a
+    deterministic, model-independent "memory was used" indicator (see
+    ``MemoryManager.describe_recall``). ``count`` is the number of discrete
+    memories injected; ``0`` means content was injected but has no discrete
+    count (e.g. a synthesized reflect answer), which the indicator renders
+    generically rather than as "0 memories". ``glyph`` is the brand mark the
+    indicator leads with.
+    """
+
+    provider_label: str
+    count: int
+    glyph: str = INDICATOR_GLYPH
+
+
+# Prompts that carry no semantic signal — trivial acknowledgements, greetings,
+# slash commands, empty input. Single source of truth shared by the core
+# per-turn prefetch gate (agent/turn_context.py, run_agent.py) and provider-
+# side classifiers (plugins/memory/honcho) so the two can never drift apart.
+# The alternation is anchored and may only be followed by whitespace or
+# punctuation, so words that merely START with a trivial word ("k8s", "yolo",
+# "note", "hindsight") do NOT match, while trailing-punctuation variants
+# ("hi!", "hey.", "thanks :)", "done???") do.
+TRIVIAL_PROMPT_RE = re.compile(
+    r'^(yes|no|ok|okay|sure|thanks|thank you|y|n|yep|nope|yeah|nah|'
+    r'hi|hey|hello|yo|sup|'
+    r'continue|go ahead|do it|proceed|got it|cool|nice|great|done|next|lgtm|k)'
+    r'[\s!?.:;,"' + "'" + r'~\u2018\u2019\u201c\u201d\u2014\u2013\u2026()\[\]{}<>*&^%$#@!+=`\u00a0]*$',
+    re.IGNORECASE,
+)
+
+
+def is_trivial_prompt(text: Optional[str]) -> bool:
+    """Return True if a user prompt is too trivial to warrant memory recall.
+
+    Empty/whitespace-only input, slash commands, and bare greetings or
+    acknowledgements (with optional trailing punctuation) all count as
+    trivial. Callers use this to skip memory-provider prefetch/injection
+    on turns that carry no semantic signal — saving a blocking network
+    round-trip and preventing stale user-model context from derailing
+    one-word replies.
+    """
+    if not text:
+        return True
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped.startswith("/"):
+        return True
+    return bool(TRIVIAL_PROMPT_RE.match(stripped))
 
 
 class MemoryProvider(ABC):
     """Abstract base class for memory providers."""
+
+    # Providers that durably checkpoint every successful on_pre_compress()
+    # call may opt into that host contract by setting the current version
+    # (PRE_COMPRESS_CHECKPOINT_API_VERSION). Version 1 is the implicit
+    # historical contract: best-effort semantics, raw message list.
+    pre_compress_checkpoint_api_version = 1
 
     @property
     @abstractmethod
@@ -78,7 +152,19 @@ class MemoryProvider(ABC):
           - agent_workspace (str): Shared workspace name (e.g. "hermes").
           - parent_session_id (str): For subagents, the parent's session_id.
           - user_id (str): Platform user identifier (gateway sessions).
+          - user_id_alt (str): Optional alternate stable platform user identifier.
         """
+
+    def unavailable_reason(self) -> str:
+        """Actionable reason this provider reports unavailable, for the caller.
+
+        ``is_available()`` gates initialization, so a provider that reports
+        unavailable is never initialized — any diagnostic it would log from
+        ``initialize()`` is unreachable. Return a short, user-facing hint here
+        (e.g. which package to install) so the caller's "provider unavailable"
+        warning can surface it. Empty string (the default) adds nothing.
+        """
+        return ""
 
     def system_prompt_block(self) -> str:
         """Return text to include in the system prompt.
@@ -111,11 +197,35 @@ class MemoryProvider(ABC):
         that do background prefetching should override this.
         """
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def recall_status(self) -> Optional[RecallStatus]:
+        """Describe what the most recent :meth:`prefetch` injected, for the UI.
+
+        Called by the agent right after prefetch, on the same (single) turn
+        thread, so it can surface a deterministic "👁️ recalled N memories"
+        status line that does not depend on the model choosing to mention it.
+
+        Return ``None`` (the default) when this provider injected nothing this
+        turn or does not want a visible indicator. Providers that override it
+        must reflect only the LAST prefetch — never a stale prior count.
+        """
+        return None
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         """Persist a completed turn to the backend.
 
         Called after each turn. Should be non-blocking — queue for
         background processing if the backend has latency.
+
+        ``messages`` is the OpenAI-style conversation message list as of the
+        completed turn, including any assistant tool calls and tool results.
+        Providers that do not need raw turn context can ignore it.
         """
 
     @abstractmethod
@@ -160,6 +270,50 @@ class MemoryProvider(ABC):
         (CLI exit, /reset, gateway session expiry).
         """
 
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        """Called when the agent switches session_id mid-process.
+
+        Fires on ``/resume``, ``/branch``, ``/reset``, ``/new`` (CLI), the
+        gateway equivalents, and context compression — any path that
+        reassigns ``AIAgent.session_id`` without tearing the provider down.
+
+        Providers that cache per-session state in ``initialize()``
+        (``_session_id``, ``_document_id``, accumulated turn buffers,
+        counters) should update or reset that state here so subsequent
+        writes land in the correct session's record.
+
+        Parameters
+        ----------
+        new_session_id:
+            The session_id the agent just switched to.
+        parent_session_id:
+            The previous session_id, if meaningful — set for ``/branch``
+            (fork lineage), context compression (continuation lineage),
+            and ``/resume`` (the session we're leaving). Empty string
+            when no lineage applies.
+        reset:
+            ``True`` when this is a genuinely new conversation, not a
+            resumption of an existing one. Fired by ``/reset`` / ``/new``.
+            Providers should flush accumulated per-session buffers
+            (``_session_turns``, ``_turn_counter``, etc.) when this is
+            set. ``False`` for ``/resume`` / ``/branch`` / compression
+            where the logical conversation continues under the new id.
+        rewound:
+            ``True`` if session_id is unchanged but the transcript was
+            truncated; providers caching per-turn document state should
+            invalidate.
+
+        Default is no-op for backward compatibility.
+        """
+
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Called before context compression discards old messages.
 
@@ -196,6 +350,10 @@ class MemoryProvider(ABC):
           required:    True if required (default: False)
           default:     default value (optional)
           choices:     list of valid values (optional)
+          type:        text, integer, number, or boolean (optional)
+          minimum:     numeric lower bound for integer/number fields (optional)
+          maximum:     numeric upper bound for integer/number fields (optional)
+          step:        numeric input step for Dashboard rendering (optional)
           url:         URL where user can get this credential (optional)
           env_var:     explicit env var name for secrets (default: auto-generated)
 
@@ -220,12 +378,39 @@ class MemoryProvider(ABC):
           should all have ``env_var`` set and this method stays no-op).
         """
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Called when the built-in memory tool writes an entry.
 
         action: 'add', 'replace', or 'remove'
         target: 'memory' or 'user'
         content: the entry content
+        metadata: structured provenance for the write, when available. Common
+          keys include ``write_origin``, ``execution_context``, ``session_id``,
+          ``parent_session_id``, ``platform``, and ``tool_name``.
 
         Use to mirror built-in memory writes to your backend.
         """
+
+    def backup_paths(self) -> List[str]:
+        """Return extra on-disk paths this provider stores OUTSIDE HERMES_HOME.
+
+        ``hermes backup`` only walks HERMES_HOME, so any provider state kept
+        under ``~/.honcho``, ``~/.hindsight``, ``~/.openviking``, etc. is lost
+        across a backup/import cycle unless it's declared here.
+
+        Return a list of absolute path strings (files or directories). The
+        backup command resolves each, captures the ones that exist and live
+        under the user's home directory into a reserved ``_external/`` subtree
+        of the archive, and ``hermes import`` restores them to their original
+        locations. Paths outside the home directory are skipped for safety.
+
+        MUST be callable without ``initialize()`` and without network — resolve
+        from config/env only. Default returns an empty list (nothing external).
+        """
+        return []

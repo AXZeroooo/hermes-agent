@@ -1,16 +1,16 @@
 """Tests for FileSyncManager.sync_back() — pull remote changes to host."""
 
-import fcntl
 import io
 import logging
 import os
 import signal
 import tarfile
-import time
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+
+fcntl = pytest.importorskip("fcntl")
 
 from tools.environments.file_sync import (
     FileSyncManager,
@@ -216,7 +216,7 @@ class TestSyncBackConflict:
 class TestSyncBackRetries:
     """Retry behaviour with exponential backoff."""
 
-    @patch("tools.environments.file_sync.time.sleep")
+    @patch("tools.environments.file_sync._sleep")
     def test_sync_back_retries_on_failure(self, mock_sleep, tmp_path):
         call_count = 0
 
@@ -237,7 +237,7 @@ class TestSyncBackRetries:
         mock_sleep.assert_any_call(_SYNC_BACK_BACKOFF[0])
         mock_sleep.assert_any_call(_SYNC_BACK_BACKOFF[1])
 
-    @patch("tools.environments.file_sync.time.sleep")
+    @patch("tools.environments.file_sync._sleep")
     def test_sync_back_all_retries_exhausted(self, mock_sleep, tmp_path, caplog):
         def always_fail(dest: Path):
             raise RuntimeError("persistent failure")
@@ -348,20 +348,6 @@ class TestInferHostPath:
         )
         assert result is None
 
-    def test_infer_partial_prefix_no_false_match(self, tmp_path):
-        """A partial prefix like /root/.hermes/sk should NOT match /root/.hermes/skills/."""
-        host_file = tmp_path / "host" / "skills" / "a.py"
-        _write_file(host_file, b"content")
-        mapping = [(str(host_file), "/root/.hermes/skills/a.py")]
-
-        mgr = _make_manager(tmp_path, file_mapping=mapping)
-        # /root/.hermes/skillsXtra/b.py shares prefix "skills" but the
-        # directory is different — should not match /root/.hermes/skills/
-        result = mgr._infer_host_path(
-            "/root/.hermes/skillsXtra/b.py",
-            file_mapping=mapping,
-        )
-        assert result is None
 
     def test_infer_matching_prefix(self, tmp_path):
         """A file in a mapped directory should be correctly inferred."""

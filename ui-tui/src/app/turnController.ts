@@ -1,18 +1,28 @@
-import { REASONING_PULSE_MS, STREAM_BATCH_MS } from '../config/timing.js'
+import {
+  REASONING_PULSE_MS,
+  STREAM_BATCH_MS,
+  STREAM_IDLE_BATCH_MS,
+  STREAM_SCROLL_BATCH_MS,
+  STREAM_TYPING_BATCH_MS
+} from '../config/timing.js'
 import type { SessionInterruptResponse, SubagentEventPayload } from '../gatewayTypes.js'
+import { appendToolShelfMessage, isToolShelfMessage } from '../lib/liveProgress.js'
 import { hasReasoningTag, splitReasoning } from '../lib/reasoning.js'
 import {
+  boundedLiveRenderText,
   buildToolTrailLine,
+  buildVerboseToolTrailLine,
   estimateTokensRough,
   isTransientTrailLine,
   sameToolTrailGroup,
   toolTrailLabel
 } from '../lib/text.js'
-import type { ActiveTool, ActivityItem, Msg, SubagentProgress } from '../types.js'
+import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '../types.js'
 
+import type { Notice } from './interfaces.js'
 import { resetFlowOverlays } from './overlayStore.js'
 import { pushSnapshot } from './spawnHistoryStore.js'
-import { getTurnState, patchTurnState, resetTurnState } from './turnStore.js'
+import { archiveDoneTodos, getTurnState, patchTurnState, resetTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
 const INTERRUPT_COOLDOWN_MS = 1500
@@ -31,6 +41,55 @@ const diffSegmentBody = (msg: Msg): null | string => {
   const m = msg.text.match(/^```diff\n([\s\S]*?)\n```$/)
 
   return m ? m[1]! : null
+}
+
+const hasDetails = (msg: Msg): boolean => Boolean(msg.thinking || msg.tools?.length || msg.toolTokens)
+
+const isTodoStatus = (status: unknown): status is TodoItem['status'] =>
+  status === 'pending' || status === 'in_progress' || status === 'completed' || status === 'cancelled'
+
+const parseTodos = (value: unknown): null | TodoItem[] => {
+  if (!Array.isArray(value)) {
+    return null
+  }
+
+  return value
+    .map(item => {
+      if (!item || typeof item !== 'object') {
+        return null
+      }
+
+      const row = item as Record<string, unknown>
+      const status = row.status
+
+      if (!isTodoStatus(status)) {
+        return null
+      }
+
+      return {
+        content: String(row.content ?? '').trim(),
+        id: String(row.id ?? '').trim(),
+        status
+      }
+    })
+    .filter((item): item is TodoItem => Boolean(item?.id && item.content))
+}
+
+const textSegments = (segments: Msg[]) =>
+  segments.filter(msg => msg.role === 'assistant' && msg.kind !== 'diff').map(msg => msg.text)
+
+const finalTail = (finalText: string, segments: Msg[]) => {
+  let tail = finalText
+
+  for (const text of textSegments(segments)) {
+    const trimmed = text.trim()
+
+    if (trimmed && tail.startsWith(trimmed)) {
+      tail = tail.slice(trimmed.length).trimStart()
+    }
+  }
+
+  return tail
 }
 
 export interface InterruptDeps {
@@ -65,14 +124,43 @@ class TurnController {
   turnTools: string[] = []
 
   private activeTools: ActiveTool[] = []
+  private activeReasoningText = ''
+  private reasoningSegmentIndex: null | number = null
+  private interimBoundaryIndex: null | number = null
   private activityId = 0
   private reasoningStreamingTimer: Timer = null
   private reasoningTimer: Timer = null
   private streamTimer: Timer = null
+  private streamDelay = STREAM_IDLE_BATCH_MS
   private toolProgressTimer: Timer = null
+
+  // ── Credits notice machinery (Strategy B) ───────────────────────────
+  //
+  // A notice arriving mid-turn must NOT show (FaceTicker wins while busy);
+  // it is held here, latest-wins, and applied at turn end via onTurnEnd().
+  // The TTL clock starts only when the notice becomes VISIBLE (on apply),
+  // never on arrival, so an 8s "restored" notice shows for its full life.
+  // `noticeTimer` is DEDICATED — it is never the shared `statusTimer`.
+  private pendingNotice: Notice | null = null
+  private noticeTimer: Timer = null
+  private noticeIdSeq = 0
+
+  boostStreamingForTyping() {
+    this.streamDelay = STREAM_TYPING_BATCH_MS
+  }
+
+  boostStreamingForScroll() {
+    this.streamDelay = Math.max(this.streamDelay, STREAM_SCROLL_BATCH_MS)
+  }
+
+  relaxStreaming() {
+    this.streamDelay = STREAM_IDLE_BATCH_MS
+  }
 
   clearReasoning() {
     this.reasoningTimer = clear(this.reasoningTimer)
+    this.activeReasoningText = ''
+    this.reasoningSegmentIndex = null
     this.reasoningText = ''
     this.toolTokenAcc = 0
     patchTurnState({ reasoning: '', reasoningTokens: 0, toolTokens: 0 })
@@ -82,8 +170,110 @@ class TurnController {
     this.statusTimer = clear(this.statusTimer)
   }
 
+  // ── Notice: arrival ──────────────────────────────────────────────────
+  //
+  // A `notification.show` arrived. If a turn is in flight (`busy`), the
+  // FaceTicker owns the verb slot, so we hold the notice (latest-wins) and
+  // let onTurnEnd() apply it when the turn finishes. If idle, apply it now.
+  // The Python side emits STABLE ids per notice kind (e.g. `credits.warn90`,
+  // `credits.restored`), NOT unique-per-emission ids.  The id-guard in
+  // applyNotice() is a defensive backup; the primary latest-wins mechanism is
+  // that applyNotice/clearNotice always cancel the prior timer first.
+  showNotice(notice: Notice) {
+    const stamped: Notice = { ...notice, id: notice.id || `n${++this.noticeIdSeq}` }
+
+    if (getUiState().busy) {
+      this.pendingNotice = stamped
+
+      return
+    }
+
+    this.applyNotice(stamped)
+  }
+
+  // ── Notice: clear by key (R3-H3 / HIGH-3) ────────────────────────────
+  //
+  // `notification.clear` only clears the visible notice when its key
+  // matches — a stale/late clear must not wipe a NEWER notice. Always drop
+  // a matching pending notice so it can't resurface at the next turn end.
+  clearNotice(key?: string) {
+    if (this.pendingNotice && this.pendingNotice.key === key) {
+      this.pendingNotice = null
+    }
+
+    if (getUiState().notice?.key === key) {
+      this.clearNoticeTimer()
+      patchUiState({ notice: null })
+    }
+  }
+
+  // Apply a notice to the visible UI state and (re)arm its TTL clock.
+  // Latest-wins: clear any prior TTL timer FIRST so an older notice's
+  // expiry can't wipe this one. A 'ttl' notice with `ttl_ms` self-expires;
+  // 'sticky' (default) persists until an explicit clear.
+  private applyNotice(notice: Notice) {
+    this.clearNoticeTimer()
+    patchUiState({ notice })
+
+    if (notice.kind === 'ttl' && typeof notice.ttl_ms === 'number' && notice.ttl_ms > 0) {
+      const id = notice.id
+
+      this.noticeTimer = setTimeout(() => {
+        this.noticeTimer = null
+
+        // Defensive backup: the prior timer was already cancelled by
+        // clearNoticeTimer() when a newer notice was applied, so in
+        // practice this guard only fires for the notice that armed it.
+        if (getUiState().notice?.id === id) {
+          patchUiState({ notice: null })
+        }
+      }, notice.ttl_ms)
+    }
+  }
+
+  private clearNoticeTimer() {
+    this.noticeTimer = clear(this.noticeTimer)
+  }
+
+  // ── Notice: turn-end flush (R3-C1 / R3-H4) ───────────────────────────
+  //
+  // Invoked ONLY by the three real turn-end sites (recordMessageComplete,
+  // interruptTurn, recordError) — NEVER by idle()/reset(), which would leak
+  // session A's notice into session B. Applies a pending NEW notice so it
+  // appears now that FaceTicker has yielded; the TTL clock starts here, when
+  // the notice first becomes visible. With no pending notice this is a
+  // no-op, so a standing sticky notice REappears untouched after the turn.
+  private flushPendingNotice() {
+    if (!this.pendingNotice) {
+      return
+    }
+
+    const notice = this.pendingNotice
+    this.pendingNotice = null
+    this.applyNotice(notice)
+  }
+
+  // Drop all notice state — pending + timer + visible (R3-H5). Called by
+  // reset()/fullReset() so a session A notice can't bleed into session B.
+  private clearNoticeState() {
+    this.pendingNotice = null
+    this.clearNoticeTimer()
+
+    if (getUiState().notice) {
+      patchUiState({ notice: null })
+    }
+  }
+
   endReasoningPhase() {
     this.reasoningStreamingTimer = clear(this.reasoningStreamingTimer)
+
+    // Seal any open reasoning segment so its isLiveReasoning flag drops the
+    // moment the reasoning phase ends — the panel must stop tracking the
+    // turn's global reasoningActive, not stay "live" for the rest of the turn.
+    if (this.reasoningSegmentIndex !== null) {
+      this.syncReasoningSegment(false)
+    }
+
     patchTurnState({ reasoningActive: false, reasoningStreaming: false })
   }
 
@@ -107,9 +297,16 @@ class TurnController {
     resetFlowOverlays()
   }
 
-  interruptTurn({ appendMessage, gw, sid, sys }: InterruptDeps) {
+  // `keepBusy` holds the session busy after interrupting so a queued message
+  // drains on the gateway's real settle edge (message.complete, suppressed
+  // while `interrupted`) instead of racing the still-unwinding turn — the race
+  // duplicated the user bubble, leaked a "queued: …" note, and surfaced the
+  // cancelled turn's "[interrupted]" reply.
+  interruptTurn({ appendMessage, gw, sid, sys }: InterruptDeps, opts: { keepBusy?: boolean } = {}) {
     this.interrupted = true
     gw.request<SessionInterruptResponse>('session.interrupt', { session_id: sid }).catch(() => {})
+
+    this.closeReasoningSegment()
 
     const segments = this.segmentMessages
     const partial = this.bufRef.trimStart()
@@ -141,13 +338,24 @@ class TurnController {
       sys('interrupted')
     }
 
-    patchUiState({ status: 'interrupted' })
     this.clearStatusTimer()
+
+    if (opts.keepBusy) {
+      // `idle()` already cleared busy; re-assert it so the drain waits for settle.
+      patchUiState({ busy: true, status: 'interrupting…' })
+
+      return
+    }
+
+    patchUiState({ status: 'interrupted' })
 
     this.statusTimer = setTimeout(() => {
       this.statusTimer = null
       patchUiState({ status: 'ready' })
     }, INTERRUPT_COOLDOWN_MS)
+
+    // Real turn end: surface any notice held back while busy.
+    this.flushPendingNotice()
   }
 
   pruneTransient() {
@@ -159,31 +367,73 @@ class TurnController {
     })
   }
 
-  flushStreamingSegment() {
-    const raw = this.bufRef.trimStart()
+  private syncReasoningSegment(live = true) {
+    const thinking = this.activeReasoningText.trim()
 
-    if (!raw) {
+    if (!thinking) {
       return
     }
 
-    const split = hasReasoningTag(raw) ? splitReasoning(raw) : { reasoning: '', text: raw }
+    const msg: Msg = {
+      kind: 'trail',
+      role: 'system',
+      text: '',
+      thinking,
+      thinkingTokens: estimateTokensRough(thinking),
+      toolTokens: this.toolTokenAcc || undefined,
+      ...(live ? { isLiveReasoning: true } : {})
+    }
+
+    if (this.reasoningSegmentIndex === null) {
+      this.reasoningSegmentIndex = this.segmentMessages.length
+      this.segmentMessages = [...this.segmentMessages, msg]
+    } else {
+      this.segmentMessages = this.segmentMessages.map((item, i) => (i === this.reasoningSegmentIndex ? msg : item))
+    }
+
+    patchTurnState({ streamSegments: this.segmentMessages })
+  }
+
+  private closeReasoningSegment() {
+    this.syncReasoningSegment(false)
+    this.activeReasoningText = ''
+    this.reasoningSegmentIndex = null
+  }
+
+  private pushSegment(msg: Msg) {
+    this.segmentMessages = appendToolShelfMessage(this.segmentMessages, msg)
+  }
+
+  flushStreamingSegment() {
+    const raw = this.bufRef.trimStart()
+
+    const split = raw
+      ? hasReasoningTag(raw)
+        ? splitReasoning(raw)
+        : { reasoning: '', text: raw }
+      : { reasoning: '', text: '' }
 
     if (split.reasoning && !this.reasoningText.trim()) {
       this.reasoningText = split.reasoning
+      this.activeReasoningText = split.reasoning
       patchTurnState({ reasoning: this.reasoningText, reasoningTokens: estimateTokensRough(this.reasoningText) })
+      this.syncReasoningSegment()
     }
 
-    const text = split.text
+    const msg: Msg = {
+      role: split.text ? 'assistant' : 'system',
+      text: split.text,
+      ...(!split.text && { kind: 'trail' as const }),
+      ...(this.pendingSegmentTools.length && { tools: this.pendingSegmentTools })
+    }
 
     this.streamTimer = clear(this.streamTimer)
 
-    if (text) {
-      const tools = this.pendingSegmentTools
-
-      this.segmentMessages = [...this.segmentMessages, { role: 'assistant', text, ...(tools.length && { tools }) }]
-      this.pendingSegmentTools = []
+    if (split.text || hasDetails(msg)) {
+      this.pushSegment(msg)
     }
 
+    this.pendingSegmentTools = []
     this.bufRef = ''
     patchTurnState({ streamPendingTools: [], streamSegments: this.segmentMessages, streaming: '' })
   }
@@ -198,7 +448,42 @@ class TurnController {
     }, REASONING_PULSE_MS)
   }
 
-  pushInlineDiffSegment(diffText: string) {
+  recordTodos(value: unknown) {
+    if (this.interrupted) {
+      return
+    }
+
+    const todos = parseTodos(value)
+
+    if (todos !== null) {
+      patchTurnState({ todos })
+    }
+  }
+
+  private flushPendingToolsIntoLastSegment() {
+    if (!this.pendingSegmentTools.length) {
+      return false
+    }
+
+    const next = appendToolShelfMessage(this.segmentMessages, {
+      kind: 'trail',
+      role: 'system',
+      text: '',
+      tools: this.pendingSegmentTools
+    })
+
+    if (next.length === this.segmentMessages.length + 1) {
+      return false
+    }
+
+    this.segmentMessages = next
+    this.pendingSegmentTools = []
+    patchTurnState({ streamPendingTools: [], streamSegments: this.segmentMessages })
+
+    return true
+  }
+
+  pushInlineDiffSegment(diffText: string, tools: string[] = []) {
     // Strip CLI chrome the gateway emits before the unified diff (e.g. a
     // leading "┊ review diff" header written by `_emit_inline_diff` for the
     // terminal printer). That header only makes sense as stdout dressing,
@@ -225,7 +510,10 @@ class TurnController {
       return
     }
 
-    this.segmentMessages = [...this.segmentMessages, { kind: 'diff', role: 'assistant', text: block }]
+    this.segmentMessages = [
+      ...this.segmentMessages,
+      { kind: 'diff', role: 'assistant', text: block, ...(tools.length && { tools }) }
+    ]
     patchTurnState({ streamSegments: this.segmentMessages })
   }
 
@@ -246,6 +534,10 @@ class TurnController {
   }
 
   pushTrail(line: string) {
+    if (this.interrupted) {
+      return
+    }
+
     patchTurnState(state => {
       if (state.turnTrail.at(-1) === line) {
         return state
@@ -267,17 +559,50 @@ class TurnController {
     this.segmentMessages = []
     this.turnTools = []
     this.persistedToolLabels.clear()
+
+    // Real turn end: surface any notice held back while busy.
+    this.flushPendingNotice()
   }
 
-  recordMessageComplete(payload: { rendered?: string; reasoning?: string; text?: string }) {
-    const rawText = (payload.rendered ?? payload.text ?? this.bufRef).trimStart()
+  recordMessageComplete(payload: {
+    rendered?: string
+    reasoning?: string
+    response_previewed?: boolean
+    text?: string
+  }) {
+    this.closeReasoningSegment()
+
+    // Ink renders markdown via <Md>; the gateway's Rich-rendered ANSI
+    // (`payload.rendered`) is for terminals that can't.  Prioritising
+    // `rendered` here garbles output whenever a user opts into
+    // `display.final_response_markdown: render` because raw ANSI escapes
+    // pass through into the React tree.  Prefer raw text and fall back
+    // only when the gateway elected not to send any (#16391).
+    const rawText = (payload.text ?? payload.rendered ?? this.bufRef).trimStart()
     const split = splitReasoning(rawText)
-    const finalText = split.text
+    // Only dedupe segments AFTER the interim boundary — interim-sealed
+    // segments are preserved even if the final text includes them.
+    // Exception: when response_previewed is true, the final text is the
+    // same model response that was published provisionally as an interim
+    // message. Dedupe against ALL segments (including sealed interims) so
+    // the identical text doesn't render as a duplicate message. (#65919
+    // review: duplicate-message blocker)
+    const dedupeStart = payload.response_previewed ? 0 : (this.interimBoundaryIndex ?? 0)
+    const finalText = finalTail(split.text, this.segmentMessages.slice(dedupeStart))
     const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()
     const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n')
-    const savedReasoningTokens = savedReasoning ? estimateTokensRough(savedReasoning) : 0
     const savedToolTokens = this.toolTokenAcc
-    const tools = this.pendingSegmentTools
+    let tools = this.pendingSegmentTools
+    const last = this.segmentMessages[this.segmentMessages.length - 1]
+
+    if (tools.length && isToolShelfMessage(last)) {
+      this.segmentMessages = [
+        ...this.segmentMessages.slice(0, -1),
+        { ...last, tools: [...(last.tools ?? []), ...tools] }
+      ]
+      this.pendingSegmentTools = []
+      tools = []
+    }
 
     // Drop diff-only segments the agent is about to narrate in the final
     // reply. Without this, a closing "here's the diff …" message would
@@ -292,17 +617,31 @@ class TurnController {
       return body === null || (!finalHasOwnDiffFence && !finalText.includes(body))
     })
 
-    const finalMessages = [...segments]
+    const hasReasoningSegment =
+      this.reasoningSegmentIndex !== null || segments.some(msg => Boolean(msg.thinking?.trim()))
+
+    const finalThinking = hasReasoningSegment ? '' : savedReasoning.trim()
+
+    const finalDetails: Msg = {
+      kind: 'trail',
+      role: 'system',
+      text: '',
+      thinking: finalThinking || undefined,
+      thinkingTokens: finalThinking ? estimateTokensRough(finalThinking) : undefined,
+      toolTokens: savedToolTokens || undefined,
+      ...(tools.length && { tools })
+    }
+
+    // Archive prepended so the trail msg anchors under the user prompt,
+    // not between thinking/tools and final assistant text.
+    const finalMessages: Msg[] = [
+      ...archiveDoneTodos(),
+      ...segments,
+      ...(hasDetails(finalDetails) ? [finalDetails] : [])
+    ]
 
     if (finalText) {
-      finalMessages.push({
-        role: 'assistant',
-        text: finalText,
-        thinking: savedReasoning || undefined,
-        thinkingTokens: savedReasoning ? savedReasoningTokens : undefined,
-        toolTokens: savedToolTokens || undefined,
-        ...(tools.length && { tools })
-      })
+      finalMessages.push({ role: 'assistant', text: finalText })
     }
 
     const wasInterrupted = this.interrupted
@@ -326,28 +665,64 @@ class TurnController {
     this.turnTools = []
     this.persistedToolLabels.clear()
     this.bufRef = ''
+    this.interrupted = false
     patchTurnState({ activity: [], outcome: '' })
+
+    // Real turn end: surface any notice held back while busy. Done after
+    // idle() flips busy=false so applyNotice() reaches the visible slot.
+    this.flushPendingNotice()
 
     return { finalMessages, finalText, wasInterrupted }
   }
 
-  recordMessageDelta({ rendered, text }: { rendered?: string; text?: string }) {
-    this.pruneTransient()
-    this.endReasoningPhase()
-
-    if (!text || this.interrupted) {
+  recordMessageDelta({ text }: { rendered?: string; text?: string }) {
+    if (this.interrupted || !text) {
       return
     }
 
-    this.bufRef = rendered ?? this.bufRef + text
+    this.pruneTransient()
+    this.endReasoningPhase()
+
+    // Always accumulate the raw text delta.  The pre-#16391 path replaced
+    // the entire buffer with `rendered` (an *incremental* Rich ANSI
+    // fragment), which on every tick discarded everything streamed so far
+    // — visible as overlapping coloured text and lost prose under
+    // `display.final_response_markdown: render`.
+    this.bufRef += text
 
     if (getUiState().streaming) {
       this.scheduleStreaming()
     }
   }
 
-  recordReasoningAvailable(text: string) {
-    if (!getUiState().showReasoning) {
+  recordInterimMessage(text: string) {
+    if (this.interrupted) {
+      return
+    }
+
+    const authoritativeText = text.trimStart()
+
+    if (!authoritativeText) {
+      return
+    }
+
+    // If the streaming buffer hasn't caught up to the authoritative interim
+    // text (e.g. the backend didn't stream every token), sync it so the
+    // sealed segment matches what the user should see.
+    if (this.bufRef.trimStart() !== authoritativeText) {
+      this.bufRef = authoritativeText
+    }
+
+    // Flush the current streaming buffer into a sealed segment — this is the
+    // TUI equivalent of the desktop's finalizeInterimAssistantMessage. The
+    // segment survives message.complete's finalTail dedupe because
+    // interimBoundaryIndex marks it as interim-sealed.
+    this.flushStreamingSegment()
+    this.interimBoundaryIndex = this.segmentMessages.length
+  }
+
+  recordReasoningAvailable(text: string, force = false) {
+    if (this.interrupted || (!force && !getUiState().showReasoning)) {
       return
     }
 
@@ -358,28 +733,136 @@ class TurnController {
     }
 
     this.reasoningText = incoming
+    this.activeReasoningText = incoming
     this.scheduleReasoning()
+    this.syncReasoningSegment()
     this.pulseReasoningStreaming()
   }
 
-  recordReasoningDelta(text: string) {
-    if (!getUiState().showReasoning) {
+  /**
+   * Render one MoA reference model's output as a committed labelled block
+   * before the aggregator responds. Unlike reasoning, references are shown
+   * regardless of showReasoning (they ARE the mixture-of-agents process the
+   * user opted into by selecting a MoA preset). Each becomes its own
+   * thinking-style segment tagged with the source model, so a multi-reference
+   * preset builds a stack the user can scroll.
+   */
+  recordMoaReference(label: string, text: string, index?: number, count?: number) {
+    if (this.interrupted) {
       return
     }
 
+    // Close any open reasoning segment so the reference block lands as its own
+    // committed entry rather than merging into streaming reasoning.
+    this.closeReasoningSegment()
+
+    const header = index && count ? `◇ Reference ${index}/${count} — ${label}` : `◇ Reference — ${label}`
+
+    const body = text.trim()
+    const thinking = body ? `${header}\n${body}` : header
+
+    this.pushSegment({
+      kind: 'trail',
+      role: 'system',
+      text: '',
+      thinking,
+      isMoaReference: true,
+      thinkingTokens: estimateTokensRough(thinking)
+    })
+    patchTurnState({ streamSegments: this.segmentMessages })
+  }
+
+  recordReasoningDelta(text: string, force = false) {
+    if (this.interrupted || (!force && !getUiState().showReasoning)) {
+      return
+    }
+
+    if (!this.activeReasoningText.trim() && this.pendingSegmentTools.length) {
+      this.flushStreamingSegment()
+    }
+
     this.reasoningText += text
+    this.activeReasoningText += text
+
+    if (this.reasoningText.length > 80_000) {
+      this.reasoningText = this.reasoningText.slice(-60_000)
+    }
+
     this.scheduleReasoning()
+    this.syncReasoningSegment()
     this.pulseReasoningStreaming()
   }
 
-  recordToolComplete(toolId: string, fallbackName?: string, error?: string, summary?: string) {
+  recordToolComplete(
+    toolId: string,
+    fallbackName?: string,
+    error?: string,
+    summary?: string,
+    duration?: number,
+    todos?: unknown,
+    resultText?: string
+  ) {
+    if (this.interrupted) {
+      return
+    }
+
+    this.recordTodos(todos)
+    const line = this.completeTool(toolId, fallbackName, error, summary, duration, resultText)
+
+    this.pendingSegmentTools = [...this.pendingSegmentTools, line]
+    this.flushPendingToolsIntoLastSegment()
+    this.publishToolState()
+  }
+
+  recordInlineDiffToolComplete(
+    diffText: string,
+    toolId: string,
+    fallbackName?: string,
+    error?: string,
+    duration?: number,
+    resultText?: string
+  ) {
+    if (this.interrupted) {
+      return
+    }
+
+    this.flushStreamingSegment()
+    this.pushInlineDiffSegment(diffText, [this.completeTool(toolId, fallbackName, error, '', duration, resultText)])
+    this.publishToolState()
+  }
+
+  private completeTool(
+    toolId: string,
+    fallbackName?: string,
+    error?: string,
+    summary?: string,
+    duration?: number,
+    resultText?: string
+  ) {
     const done = this.activeTools.find(tool => tool.id === toolId)
     const name = done?.name ?? fallbackName ?? 'tool'
     const label = toolTrailLabel(name)
-    const line = buildToolTrailLine(name, done?.context || '', Boolean(error), error || summary || '')
+    const fallbackDuration = done?.startedAt ? (Date.now() - done.startedAt) / 1000 : undefined
+
+    const line =
+      done?.verboseArgs || resultText
+        ? buildVerboseToolTrailLine(
+            name,
+            done?.context || '',
+            Boolean(error),
+            duration ?? fallbackDuration,
+            done?.verboseArgs,
+            error || resultText || summary || ''
+          )
+        : buildToolTrailLine(
+            name,
+            done?.context || '',
+            Boolean(error),
+            error || summary || '',
+            duration ?? fallbackDuration
+          )
 
     this.activeTools = this.activeTools.filter(tool => tool.id !== toolId)
-    this.pendingSegmentTools = [...this.pendingSegmentTools, line]
 
     const next = this.turnTools.filter(item => !sameToolTrailGroup(label, item))
 
@@ -388,6 +871,11 @@ class TurnController {
     }
 
     this.turnTools = next.slice(-TRAIL_LIMIT)
+
+    return line
+  }
+
+  private publishToolState() {
     patchTurnState({
       streamPendingTools: this.pendingSegmentTools,
       tools: this.activeTools,
@@ -396,6 +884,10 @@ class TurnController {
   }
 
   recordToolProgress(toolName: string, preview: string) {
+    if (this.interrupted) {
+      return
+    }
+
     const index = this.activeTools.findIndex(tool => tool.name === toolName)
 
     if (index < 0) {
@@ -414,15 +906,20 @@ class TurnController {
     }, STREAM_BATCH_MS)
   }
 
-  recordToolStart(toolId: string, name: string, context: string) {
+  recordToolStart(toolId: string, name: string, context: string, verboseArgs?: string) {
+    if (this.interrupted) {
+      return
+    }
+
     this.flushStreamingSegment()
+    this.closeReasoningSegment()
     this.pruneTransient()
     this.endReasoningPhase()
 
     const sample = `${name} ${context}`.trim()
 
     this.toolTokenAcc += sample ? estimateTokensRough(sample) : 0
-    this.activeTools = [...this.activeTools, { context, id: toolId, name, startedAt: Date.now() }]
+    this.activeTools = [...this.activeTools, { context, id: toolId, name, startedAt: Date.now(), verboseArgs }]
 
     patchTurnState({ toolTokens: this.toolTokenAcc, tools: this.activeTools })
   }
@@ -434,12 +931,18 @@ class TurnController {
     this.bufRef = ''
     this.interrupted = false
     this.lastStatusNote = ''
+    this.activeReasoningText = ''
     this.pendingSegmentTools = []
     this.protocolWarned = false
+    this.reasoningSegmentIndex = null
+    this.interimBoundaryIndex = null
     this.segmentMessages = []
     this.turnTools = []
     this.toolTokenAcc = 0
     this.persistedToolLabels.clear()
+    // Session boundary: drop notice state so session A's sticky can't bleed
+    // into session B (R3-H5). reset()/fullReset() CLEAR — they never flush.
+    this.clearNoticeState()
     patchTurnState({ activity: [], outcome: '' })
   }
 
@@ -471,17 +974,42 @@ class TurnController {
       this.streamTimer = null
       const raw = this.bufRef.trimStart()
       const visible = hasReasoningTag(raw) ? splitReasoning(raw).text : raw
-      patchTurnState({ streaming: visible })
-    }, STREAM_BATCH_MS)
+      patchTurnState({ streaming: boundedLiveRenderText(visible) })
+    }, this.streamDelay)
+  }
+
+  hydrateStreamingText(text: string) {
+    this.streamTimer = clear(this.streamTimer)
+    this.bufRef = text
+    const raw = this.bufRef.trimStart()
+    const visible = hasReasoningTag(raw) ? splitReasoning(raw).text : raw
+    patchTurnState({ streaming: boundedLiveRenderText(visible) })
   }
 
   startMessage() {
     this.endReasoningPhase()
     this.clearReasoning()
     this.activeTools = []
+    this.activeReasoningText = ''
+    this.reasoningSegmentIndex = null
+    this.interimBoundaryIndex = null
     this.turnTools = []
     this.toolTokenAcc = 0
+    this.interrupted = false
     this.persistedToolLabels.clear()
+    // "Flash and yield" notices clear when a new turn starts: a usage-band heads-up
+    // (credits.usage, 50/75/90%) and the one-time "grant spent" transition
+    // (credits.grant_spent) should show once, then get out of the way — not camp the
+    // bar (e.g. "Grant spent · $990 top-up left" sitting there with plenty of top-up
+    // left). Depletion (credits.depleted) and other notices stay — they're explicitly
+    // sticky until the policy clears them. The Python `active` latch retains the key,
+    // so a yielded notice won't re-fire on the next turn.
+    const yieldingNoticeKey = getUiState().notice?.key
+
+    if (yieldingNoticeKey === 'credits.usage' || yieldingNoticeKey === 'credits.grant_spent') {
+      this.clearNotice(yieldingNoticeKey)
+    }
+
     patchUiState({ busy: true })
     patchTurnState({ activity: [], outcome: '', subagents: [], toolTokens: 0, tools: [], turnTrail: [] })
   }

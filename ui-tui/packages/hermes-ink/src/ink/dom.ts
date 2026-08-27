@@ -17,13 +17,7 @@ type InkNode = {
 
 export type TextName = '#text'
 export type ElementNames =
-  | 'ink-root'
-  | 'ink-box'
-  | 'ink-text'
-  | 'ink-virtual-text'
-  | 'ink-link'
-  | 'ink-progress'
-  | 'ink-raw-ansi'
+  'ink-root' | 'ink-box' | 'ink-text' | 'ink-virtual-text' | 'ink-link' | 'ink-progress' | 'ink-raw-ansi'
 
 export type NodeNames = ElementNames | TextName
 
@@ -59,6 +53,11 @@ export type DOMElement = {
   // intermediate frames instead of one big jump. Direction reversal
   // naturally cancels (pure accumulator, no target tracking).
   pendingScrollDelta?: number
+  // One-render record of additive scrollTop changes made to preserve the
+  // visual anchor after content above the viewport changes height. The
+  // renderer subtracts this when evaluating positional bottom-follow and
+  // defers pending input for that paint, then clears the record.
+  scrollTopCompensation?: number
   // Render-time clamp bounds for virtual scroll. useVirtualScroll writes
   // the currently-mounted children's coverage span; render-node-to-output
   // clamps scrollTop to stay within it. Prevents blank screen when
@@ -323,27 +322,39 @@ const measureTextNode = function (
   widthMode: LayoutMeasureMode
 ): { width: number; height: number } {
   const elem = node.nodeName !== '#text' ? (node as DOMElement) : node.parentNode
+
   if (elem && elem.nodeName === 'ink-text') {
     let cache = elem._textMeasureCache
+
     if (!cache) {
       cache = { gen: 0, entries: new Map() }
       elem._textMeasureCache = cache
     }
+
     const key = `${width}|${widthMode}`
     const hit = cache.entries.get(key)
+
     if (hit && hit._gen === cache.gen) {
       return hit.result
     }
+
     const result = computeTextMeasure(node, width, widthMode)
+
     // Enforce cap with FIFO eviction to avoid unbounded growth during
     // pathological frames where yoga probes many widths.
     if (cache.entries.size >= MEASURE_CACHE_CAP) {
       const firstKey = cache.entries.keys().next().value
-      cache.entries.delete(firstKey)
+
+      if (firstKey !== undefined) {
+        cache.entries.delete(firstKey)
+      }
     }
+
     cache.entries.set(key, { _gen: cache.gen, result })
+
     return result
   }
+
   return computeTextMeasure(node, width, widthMode)
 }
 
@@ -475,6 +486,7 @@ export const clearYogaNodeReferences = (node: DOMElement | TextNode): void => {
     for (const child of node.childNodes) {
       clearYogaNodeReferences(child)
     }
+
     node._textMeasureCache = undefined
   }
 

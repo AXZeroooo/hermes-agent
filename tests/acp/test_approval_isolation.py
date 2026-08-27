@@ -13,11 +13,32 @@ Both fixed together by:
    threads don't collide.
 """
 
-import os
 import threading
-from unittest.mock import MagicMock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_approval_state(monkeypatch):
+    """Keep these security regression tests hermetic.
+
+    Earlier tests (e.g. tests/acp/test_permissions.py) lazily load the
+    developer's real ``~/.hermes/config.yaml`` command allowlist into
+    ``tools.approval._permanent_approved``. If that allowlist contains a
+    pattern like "recursive delete", ``rm -rf …`` is auto-approved before
+    the interactive callback fires and the GHSA regression assertions fail
+    for reasons unrelated to the code under test.
+    """
+    import tools.approval as _approval
+
+    monkeypatch.setattr(_approval, "_permanent_approved", set())
+    monkeypatch.setattr(_approval, "_session_approved", {})
+    # These tests assert the *manual* interactive-callback path. The default
+    # config is approvals.mode=smart, whose guardian LLM can auto-approve the
+    # command before the callback is consulted (test-order dependent, since
+    # load_config() caching decides which config file is in effect). Pin the
+    # mode so the GHSA regression path is what actually runs.
+    monkeypatch.setattr(_approval, "_get_approval_mode", lambda: "manual")
 
 
 class TestThreadLocalApprovalCallback:
@@ -96,27 +117,30 @@ class TestThreadLocalApprovalCallback:
         # Main thread still has its callback
         assert _get_approval_callback() is cb_main
 
-    def test_sudo_password_callback_also_thread_local(self):
-        """Same protection applies to the sudo password callback."""
+
+    def test_sudo_password_cache_does_not_leak_across_threads(self):
+        """Interactive sudo cache must not bleed into another executor thread."""
         from tools.terminal_tool import (
-            set_sudo_password_callback,
-            _get_sudo_password_callback,
+            _get_cached_sudo_password,
+            _reset_cached_sudo_passwords,
+            _set_cached_sudo_password,
         )
 
-        cb_main = lambda: "main-password"  # noqa: E731
-        set_sudo_password_callback(cb_main)
+        _reset_cached_sudo_passwords()
+        _set_cached_sudo_password("main-thread-password")
 
         worker_saw = []
 
         def worker():
-            worker_saw.append(_get_sudo_password_callback())
+            worker_saw.append(_get_cached_sudo_password())
 
         t = threading.Thread(target=worker)
         t.start()
         t.join()
 
-        assert worker_saw == [None]
-        assert _get_sudo_password_callback() is cb_main
+        assert worker_saw == [""]
+        assert _get_cached_sudo_password() == "main-thread-password"
+
 
 
 class TestAcpExecAskGate:
@@ -168,3 +192,4 @@ class TestAcpExecAskGate:
             "GHSA-96vc-wcxf-jjff"
         )
         assert result["approved"] is True
+

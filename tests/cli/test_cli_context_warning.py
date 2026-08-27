@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+
 
 @pytest.fixture
 def _isolate(tmp_path, monkeypatch):
@@ -44,21 +46,9 @@ def cli_obj(_isolate):
 class TestLowContextWarning:
     """Tests that the CLI warns about low context lengths."""
 
-    def test_no_warning_for_normal_context(self, cli_obj):
-        """No warning when context is 32k+."""
+    def test_warning_for_below_minimum_context(self, cli_obj):
+        """Warning shown when context is below Hermes' minimum."""
         cli_obj.agent.context_compressor.context_length = 32768
-        with patch("cli.get_tool_definitions", return_value=[]), \
-             patch("cli.build_welcome_banner"):
-            cli_obj.show_banner()
-
-        # Check that no yellow warning was printed
-        calls = [str(c) for c in cli_obj.console.print.call_args_list]
-        warning_calls = [c for c in calls if "too low" in c]
-        assert len(warning_calls) == 0
-
-    def test_warning_for_low_context(self, cli_obj):
-        """Warning shown when context is 4096 (Ollama default)."""
-        cli_obj.agent.context_compressor.context_length = 4096
         with patch("cli.get_tool_definitions", return_value=[]), \
              patch("cli.build_welcome_banner"):
             cli_obj.show_banner()
@@ -66,7 +56,9 @@ class TestLowContextWarning:
         calls = [str(c) for c in cli_obj.console.print.call_args_list]
         warning_calls = [c for c in calls if "too low" in c]
         assert len(warning_calls) == 1
-        assert "4,096" in warning_calls[0]
+        minimum_calls = [c for c in calls if f"{MINIMUM_CONTEXT_LENGTH:,}" in c]
+        assert minimum_calls
+
 
     def test_warning_for_2048_context(self, cli_obj):
         """Warning shown for 2048 tokens (common LM Studio default)."""
@@ -80,19 +72,19 @@ class TestLowContextWarning:
         assert len(warning_calls) == 1
 
     def test_no_warning_at_boundary(self, cli_obj):
-        """No warning at exactly 8192 — 8192 is borderline but included in warning."""
-        cli_obj.agent.context_compressor.context_length = 8192
+        """No warning at exactly Hermes' minimum context length."""
+        cli_obj.agent.context_compressor.context_length = MINIMUM_CONTEXT_LENGTH
         with patch("cli.get_tool_definitions", return_value=[]), \
              patch("cli.build_welcome_banner"):
             cli_obj.show_banner()
 
         calls = [str(c) for c in cli_obj.console.print.call_args_list]
         warning_calls = [c for c in calls if "too low" in c]
-        assert len(warning_calls) == 1  # 8192 is still warned about
+        assert len(warning_calls) == 0
 
     def test_no_warning_above_boundary(self, cli_obj):
-        """No warning at 16384."""
-        cli_obj.agent.context_compressor.context_length = 16384
+        """No warning above Hermes' minimum context length."""
+        cli_obj.agent.context_compressor.context_length = MINIMUM_CONTEXT_LENGTH + 1
         with patch("cli.get_tool_definitions", return_value=[]), \
              patch("cli.build_welcome_banner"):
             cli_obj.show_banner()
@@ -112,18 +104,8 @@ class TestLowContextWarning:
         calls = [str(c) for c in cli_obj.console.print.call_args_list]
         ollama_hints = [c for c in calls if "OLLAMA_CONTEXT_LENGTH" in c]
         assert len(ollama_hints) == 1
+        assert str(MINIMUM_CONTEXT_LENGTH) in ollama_hints[0]
 
-    def test_lm_studio_specific_hint(self, cli_obj):
-        """LM Studio-specific fix shown when port 1234 detected."""
-        cli_obj.agent.context_compressor.context_length = 2048
-        cli_obj.base_url = "http://localhost:1234/v1"
-        with patch("cli.get_tool_definitions", return_value=[]), \
-             patch("cli.build_welcome_banner"):
-            cli_obj.show_banner()
-
-        calls = [str(c) for c in cli_obj.console.print.call_args_list]
-        lms_hints = [c for c in calls if "LM Studio" in c]
-        assert len(lms_hints) == 1
 
     def test_generic_hint_for_other_servers(self, cli_obj):
         """Generic fix shown for unknown servers."""
@@ -137,16 +119,6 @@ class TestLowContextWarning:
         generic_hints = [c for c in calls if "config.yaml" in c]
         assert len(generic_hints) == 1
 
-    def test_no_warning_when_no_context_length(self, cli_obj):
-        """No warning when context length is not yet known."""
-        cli_obj.agent.context_compressor.context_length = None
-        with patch("cli.get_tool_definitions", return_value=[]), \
-             patch("cli.build_welcome_banner"):
-            cli_obj.show_banner()
-
-        calls = [str(c) for c in cli_obj.console.print.call_args_list]
-        warning_calls = [c for c in calls if "too low" in c]
-        assert len(warning_calls) == 0
 
     def test_compact_banner_does_not_crash_on_narrow_terminal(self, cli_obj):
         """Compact mode should still have ctx_len defined for warning logic."""

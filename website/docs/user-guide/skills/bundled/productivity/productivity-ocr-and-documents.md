@@ -1,14 +1,14 @@
 ---
-title: "Ocr And Documents — Extract text from PDFs and scanned documents"
+title: "Ocr And Documents — Extract text from PDFs/scans (pymupdf, marker-pdf)"
 sidebar_label: "Ocr And Documents"
-description: "Extract text from PDFs and scanned documents"
+description: "Extract text from PDFs/scans (pymupdf, marker-pdf)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Ocr And Documents
 
-Extract text from PDFs and scanned documents. Use web_extract for remote URLs, pymupdf for local text-based PDFs, marker-pdf for OCR/scanned docs. For DOCX use python-docx, for PPTX see the powerpoint skill.
+Extract text from PDFs/scans (pymupdf, marker-pdf).
 
 ## Skill metadata
 
@@ -19,8 +19,9 @@ Extract text from PDFs and scanned documents. Use web_extract for remote URLs, p
 | Version | `2.3.0` |
 | Author | Hermes Agent |
 | License | MIT |
+| Platforms | linux, macos, windows |
 | Tags | `PDF`, `Documents`, `Research`, `Arxiv`, `Text-Extraction`, `OCR` |
-| Related skills | [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) |
+| Related skills | [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf), [`docx`](/docs/user-guide/skills/bundled/productivity/productivity-docx), [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) |
 
 ## Reference: full SKILL.md
 
@@ -30,9 +31,12 @@ The following is the complete skill definition that Hermes loads when this skill
 
 # PDF & Document Extraction
 
-For DOCX: use `python-docx` (parses actual document structure, far better than OCR).
-For PPTX: see the `powerpoint` skill (uses `python-pptx` with full slide/notes support).
-This skill covers **PDFs and scanned documents**.
+For DOCX: see the `docx` skill (create/edit) or use `python-docx` for structured reads.
+For PPTX: see the `powerpoint` skill (full create/read/edit support).
+For PDF manipulation (merge, split, forms, watermarks, creation): see the `pdf` skill.
+This skill covers **text extraction from PDFs and scanned documents**.
+
+> **Coming from a `read_file` EXTRACTION COVERAGE WARNING?** `read_file` auto-converts local PDFs but reads the text layer only; the warning footer lists the pages that yielded no text (scanned images). For a handful of pages, render + vision is fastest: `pdftoppm -jpeg -r 150 -f N -l N file.pdf /tmp/page` then `vision_analyze` each image. For bulk OCR of many pages, use marker-pdf below (Step 2).
 
 ## Step 1: Remote URL Available?
 

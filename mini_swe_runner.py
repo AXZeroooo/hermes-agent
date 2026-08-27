@@ -29,15 +29,12 @@ Usage:
 import json
 import logging
 import os
-import sys
-import time
-import uuid
 from datetime import datetime
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional
 
 import fire
 from dotenv import load_dotenv
+from agent.tool_dispatch_helpers import make_tool_result_message
 
 # Load environment variables
 load_dotenv()
@@ -197,12 +194,6 @@ class MiniSWERunner:
         self.image = image
         self.cwd = cwd
         
-        # Setup logging
-        logging.basicConfig(
-            level=logging.DEBUG if verbose else logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%H:%M:%S'
-        )
         self.logger = logging.getLogger(__name__)
         
         # Initialize LLM client via centralized provider router.
@@ -476,7 +467,7 @@ Complete the user's task step by step."""
 
                     response = self.client.chat.completions.create(**api_kwargs)
                 except Exception as e:
-                    self.logger.error(f"API call failed: {e}")
+                    self.logger.error("API call failed: %s", e)
                     break
                 
                 assistant_message = response.choices[0].message
@@ -536,11 +527,9 @@ Complete the user's task step by step."""
                             completed = True
                         
                         # Add tool response
-                        messages.append({
-                            "role": "tool",
-                            "content": result_json,
-                            "tool_call_id": tc.id
-                        })
+                        messages.append(make_tool_result_message(
+                            tc.function.name, result_json, tc.id,
+                        ))
                         
                         print(f"   ✅ exit_code={result['exit_code']}, output={len(result['output'])} chars")
                     
@@ -618,7 +607,7 @@ Complete the user's task step by step."""
                     print(f"✅ Task {i} completed (api_calls={result['api_calls']})")
                     
                 except Exception as e:
-                    self.logger.error(f"Error on task {i}: {e}")
+                    self.logger.error("Error on task %s: %s", i, e)
                     error_result = {
                         "conversations": [],
                         "completed": False,
@@ -681,6 +670,13 @@ def main(
     """
     print("🚀 Mini-SWE Runner with Hermes Trajectory Format")
     print("=" * 60)
+    
+    # Configure root logging at the entry point (not in library __init__).
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
     
     # Initialize runner
     runner = MiniSWERunner(

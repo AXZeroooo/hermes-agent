@@ -5,8 +5,10 @@ from __future__ import annotations
 import importlib
 import os
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from hermes_state import SessionDB
 from tools.todo_tool import TodoStore
@@ -33,7 +35,6 @@ class _FakeAgent:
         self._todo_store.write(
             [{"id": "t1", "content": "unfinished task", "status": "in_progress"}]
         )
-        self.flush_memories = MagicMock()
         self.commit_memory_session = MagicMock()
         self._invalidate_system_prompt = MagicMock()
 
@@ -131,7 +132,21 @@ def _prepare_cli_with_active_session(tmp_path):
     old_session_start = cli.session_start - timedelta(seconds=1)
     cli.session_start = old_session_start
     cli.agent.session_start = old_session_start
+
+    # Bypass the destructive-slash confirmation gate — these tests focus on
+    # the new-session mechanics, not the confirm prompt itself (covered in
+    # tests/cli/test_destructive_slash_confirm.py).
+    cli._confirm_destructive_slash = lambda *_a, **_kw: "once"
     return cli
+
+
+@pytest.fixture(autouse=True)
+def _reset_session_id_context():
+    from gateway.session_context import _UNSET, _VAR_MAP
+
+    yield
+    os.environ.pop("HERMES_SESSION_ID", None)
+    _VAR_MAP["HERMES_SESSION_ID"].set(_UNSET)
 
 
 def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path):
@@ -157,19 +172,59 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     assert cli.agent._todo_store.read() == []
     assert cli.session_start > old_session_start
     assert cli.agent.session_start == cli.session_start
-    cli.agent.flush_memories.assert_called_once_with([{"role": "user", "content": "hello"}])
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
-def test_reset_command_is_alias_for_new_session(tmp_path):
+
+
+
+
+def test_new_session_delivers_context_engine_boundary_synchronously(tmp_path):
+    """The context-engine on_session_end must fire during /new itself.
+
+    It is cheap local state work and ordering-sensitive: it must land before
+    reset_session_state() rebinds the engine to the new session. The LLM-bound
+    provider extraction is what gets deferred, not this."""
     cli = _prepare_cli_with_active_session(tmp_path)
     old_session_id = cli.session_id
 
-    cli.process_command("/reset")
+    engine_calls = []
+    cli.agent.context_compressor.on_session_end = (
+        lambda sid, msgs: engine_calls.append((sid, list(msgs)))
+    )
 
-    assert cli.session_id != old_session_id
-    assert cli._session_db.get_session(old_session_id)["end_reason"] == "new_session"
-    assert cli._session_db.get_session(cli.session_id) is not None
+    cli.process_command("/new")
+
+    assert engine_calls == [(old_session_id, [{"role": "user", "content": "hello"}])]
+
+
+def test_run_cleanup_flushes_pending_memory_manager_work(tmp_path):
+    """A '/new then quit' must not drop the queued old-session extraction.
+
+    _run_cleanup gives the manager's serialized worker a bounded drain via
+    flush_pending() before shutdown_all()'s short-fuse drain runs."""
+    import cli as _cli_mod
+
+    agent = MagicMock()
+    mm = MagicMock()
+    mm.flush_pending.return_value = True
+    agent._memory_manager = mm
+    agent._session_messages = []
+
+    old_ref = _cli_mod._active_agent_ref
+    _cli_mod._active_agent_ref = agent
+    _cli_mod._cleanup_done = False
+    try:
+        _cli_mod._run_cleanup(notify_session_finalize=False)
+    finally:
+        _cli_mod._cleanup_done = True
+        _cli_mod._active_agent_ref = old_ref
+
+    mm.flush_pending.assert_called_once_with(timeout=10)
+
+
+
+
 
 
 def test_clear_command_starts_new_session_before_redrawing(tmp_path):
@@ -221,3 +276,24 @@ def test_new_session_resets_token_counters(tmp_path):
     assert comp.last_total_tokens == 0
     assert comp.compression_count == 0
     assert comp._context_probed is False
+
+
+def test_new_session_with_title(capsys):
+    """new_session(title=...) creates a session and sets the title."""
+    cli = _make_cli()
+    cli._session_db = MagicMock()
+    cli.agent = _FakeAgent("old_session_id", datetime.now())
+    cli.conversation_history = []
+
+    cli.new_session(title="My Test Session")
+
+    # Assert set_session_title was called with the new session ID and sanitized title
+    cli._session_db.set_session_title.assert_called_once()
+    call_args = cli._session_db.set_session_title.call_args
+    assert call_args[0][0] == cli.session_id
+    assert call_args[0][1] == "My Test Session"
+
+    captured = capsys.readouterr()
+    assert "My Test Session" in captured.out
+
+

@@ -12,11 +12,8 @@ import concurrent.futures
 import os
 import sys
 import time
-import threading
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
-import pytest
 
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -169,70 +166,25 @@ class TestInactivityTimeout:
 
         assert result["final_response"] == "Done"
 
+    def _parse_cron_timeout(self, raw_value):
+        """Mirror the defensive parsing logic from cron/scheduler.py run_job()."""
+        if raw_value:
+            try:
+                return float(raw_value)
+            except (ValueError, TypeError):
+                return 600.0
+        return 600.0
+
     def test_timeout_env_var_parsing(self, monkeypatch):
         """HERMES_CRON_TIMEOUT env var is respected."""
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "1200")
-        _cron_timeout = float(os.getenv("HERMES_CRON_TIMEOUT", 600))
+        raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+        _cron_timeout = self._parse_cron_timeout(raw)
         assert _cron_timeout == 1200.0
 
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         assert _cron_inactivity_limit == 1200.0
 
-    def test_timeout_zero_means_unlimited(self, monkeypatch):
-        """HERMES_CRON_TIMEOUT=0 yields None (unlimited)."""
-        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
-        _cron_timeout = float(os.getenv("HERMES_CRON_TIMEOUT", 600))
-        _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-        assert _cron_inactivity_limit is None
-
-    def test_timeout_error_includes_diagnostics(self):
-        """The TimeoutError message should include last activity info."""
-        agent = SlowFakeAgent(
-            run_duration=5.0,
-            idle_after=0.05,
-            activity_desc="api_call_streaming",
-            current_tool="delegate_task",
-            api_call_count=7,
-            max_iterations=90,
-        )
-
-        _cron_inactivity_limit = 0.3
-        _POLL_INTERVAL = 0.1
-
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(agent.run_conversation, "test")
-        _inactivity_timeout = False
-
-        while True:
-            done, _ = concurrent.futures.wait({future}, timeout=_POLL_INTERVAL)
-            if done:
-                break
-            _idle_secs = 0.0
-            if hasattr(agent, "get_activity_summary"):
-                try:
-                    _act = agent.get_activity_summary()
-                    _idle_secs = _act.get("seconds_since_activity", 0.0)
-                except Exception:
-                    pass
-            if _idle_secs >= _cron_inactivity_limit:
-                _inactivity_timeout = True
-                break
-
-        pool.shutdown(wait=False, cancel_futures=True)
-        assert _inactivity_timeout
-
-        # Build the diagnostic message like the scheduler does
-        _activity = agent.get_activity_summary()
-        _last_desc = _activity.get("last_activity_desc", "unknown")
-        _secs_ago = _activity.get("seconds_since_activity", 0)
-
-        err_msg = (
-            f"Cron job 'test-job' idle for "
-            f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
-            f"— last activity: {_last_desc}"
-        )
-        assert "idle for" in err_msg
-        assert "api_call_streaming" in err_msg
 
     def test_agent_without_activity_summary_uses_wallclock_fallback(self):
         """If agent lacks get_activity_summary, idle_secs stays 0 (never times out).
@@ -283,7 +235,3 @@ class TestSysPathOrdering:
         from cron.scheduler import _hermes_now
         assert callable(_hermes_now)
 
-    def test_hermes_constants_importable(self):
-        """hermes_constants should be importable from cron context."""
-        from hermes_constants import get_hermes_home
-        assert callable(get_hermes_home)

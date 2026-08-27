@@ -20,6 +20,17 @@ Usage:
     python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=my_run --distribution=image_gen
 """
 
+# IMPORTANT: hermes_bootstrap must be the very first import — UTF-8 stdio
+# on Windows.  No-op on POSIX.  See hermes_bootstrap.py for full rationale.
+try:
+    import hermes_bootstrap  # noqa: F401
+except ModuleNotFoundError:
+    # Graceful fallback when hermes_bootstrap isn't registered in the venv
+    # yet — happens during partial ``hermes update`` where git-reset landed
+    # new code but ``uv pip install -e .`` didn't finish.  Missing bootstrap
+    # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
+    pass
+
 import json
 import logging
 import os
@@ -271,7 +282,7 @@ def _process_single_prompt(
                         print(f"   Prompt {prompt_index}: Pulling docker image {container_image}...", flush=True)
                     pull = _sp.run(
                         ["docker", "pull", container_image],
-                        capture_output=True, text=True, timeout=600,
+                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=600,
                     )
                     if pull.returncode != 0:
                         return {
@@ -326,6 +337,7 @@ def _process_single_prompt(
             providers_ignored=config.get("providers_ignored"),
             providers_order=config.get("providers_order"),
             provider_sort=config.get("provider_sort"),
+            openrouter_min_coding_score=config.get("openrouter_min_coding_score"),
             max_tokens=config.get("max_tokens"),
             reasoning_config=config.get("reasoning_config"),
             prefill_messages=config.get("prefill_messages"),
@@ -445,6 +457,21 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
                 print(f"   🚫 Prompt {prompt_index} discarded (no reasoning in any turn)")
                 discarded_no_reasoning += 1
                 completed_in_batch.append(prompt_index)
+                # Tombstone row (#93527): resume filters exclusively by
+                # scanning batch_*.jsonl rows for prompt content, so a
+                # discarded sample without a row is invisible to --resume
+                # and gets re-run at full cost on every restart. The
+                # tombstone carries just enough for the scan; the merge
+                # step excludes it from trajectories.jsonl.
+                tombstone = {
+                    "prompt_index": prompt_index,
+                    "discarded": "no_reasoning",
+                    "prompt": _entry_prompt_text(prompt_data),
+                }
+                with open(batch_output_file, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(tombstone, ensure_ascii=False) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
                 continue
             
             # Get and normalize tool stats for consistent schema across all entries
@@ -473,6 +500,8 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
             # Append to batch output file
             with open(batch_output_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(trajectory_entry, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
         
         # Aggregate tool statistics
         for tool_name, stats in result.get("tool_stats", {}).items():
@@ -512,6 +541,31 @@ def _process_batch_worker(args: Tuple) -> Dict[str, Any]:
     }
 
 
+def _entry_prompt_text(entry: Dict) -> str:
+    """Extract the human prompt text from a dataset or trajectory entry.
+
+    Handles the shapes that appear across batch_runner: a flat
+    ``entry["prompt"]``, ShareGPT-style ``conversations`` (``from``/``value``),
+    chat-style ``conversations``/``messages`` (``role``/``content``), and the
+    discard tombstones written by the no-reasoning discard path.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    text = str(entry.get("prompt") or "").strip()
+    if text:
+        return text
+    for key in ("conversations", "messages"):
+        for msg in entry.get(key, []) or []:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role") or msg.get("from")
+            if role in {"user", "human"}:
+                text = str(msg.get("content") or msg.get("value") or "").strip()
+                if text:
+                    return text
+    return ""
+
+
 class BatchRunner:
     """
     Manages batch processing of agent prompts with checkpointing and statistics.
@@ -535,6 +589,7 @@ class BatchRunner:
         providers_ignored: List[str] = None,
         providers_order: List[str] = None,
         provider_sort: str = None,
+        openrouter_min_coding_score: Optional[float] = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
@@ -584,6 +639,7 @@ class BatchRunner:
         self.providers_ignored = providers_ignored
         self.providers_order = providers_order
         self.provider_sort = provider_sort
+        self.openrouter_min_coding_score = openrouter_min_coding_score
         self.max_tokens = max_tokens
         self.reasoning_config = reasoning_config
         self.prefill_messages = prefill_messages
@@ -739,19 +795,17 @@ class BatchRunner:
                     for line in f:
                         try:
                             entry = json.loads(line.strip())
-                            
+
                             # Skip failed entries - we want to retry these
                             if entry.get("failed", False):
                                 continue
-                            
-                            # Extract the human/user prompt from conversations
-                            conversations = entry.get("conversations", [])
-                            for msg in conversations:
-                                if msg.get("from") == "human":
-                                    prompt_text = msg.get("value", "").strip()
-                                    if prompt_text:
-                                        completed_prompts.add(prompt_text)
-                                    break  # Only need the first human message
+
+                            # Discard tombstones count as completed — the
+                            # prompt was processed and deliberately dropped
+                            # (#93527); re-running it would just re-discard.
+                            prompt_text = _entry_prompt_text(entry)
+                            if prompt_text:
+                                completed_prompts.add(prompt_text)
                         except json.JSONDecodeError:
                             continue
             except Exception as e:
@@ -781,7 +835,7 @@ class BatchRunner:
                 conversations = entry.get("conversations", [])
                 for msg in conversations:
                     role = msg.get("role") or msg.get("from")
-                    if role in ("user", "human"):
+                    if role in {"user", "human"}:
                         prompt_text = (msg.get("content") or msg.get("value", "")).strip()
                         break
             
@@ -848,13 +902,32 @@ class BatchRunner:
                 "last_updated": None
             }
         
-        # Prepare configuration for workers
+        # Prepare configuration for workers.
+        #
+        # ``self.api_key`` may be a zero-arg callable (Azure Foundry Entra ID
+        # bearer provider returned by ``agent.azure_identity_adapter``). Such
+        # closures are not safely picklable across the multiprocessing.Pool
+        # boundary. Drop the callable here and let each worker rebuild its
+        # own provider via ``resolve_runtime_provider()``, which reads
+        # ``model.auth_mode`` from ``config.yaml`` and constructs a fresh
+        # token provider in the worker process (azure-identity caches
+        # in-process so each worker gets its own short-lived cache).
+        if callable(self.api_key) and not isinstance(self.api_key, str):
+            worker_api_key = None
+            print(
+                "ℹ️  Detected Entra ID bearer provider — workers will rebuild "
+                "credentials from config.yaml in each process.",
+                flush=True,
+            )
+        else:
+            worker_api_key = self.api_key
+
         config = {
             "distribution": self.distribution,
             "model": self.model,
             "max_iterations": self.max_iterations,
             "base_url": self.base_url,
-            "api_key": self.api_key,
+            "api_key": worker_api_key,
             "verbose": self.verbose,
             "ephemeral_system_prompt": self.ephemeral_system_prompt,
             "log_prefix_chars": self.log_prefix_chars,
@@ -862,6 +935,7 @@ class BatchRunner:
             "providers_ignored": self.providers_ignored,
             "providers_order": self.providers_order,
             "provider_sort": self.provider_sort,
+            "openrouter_min_coding_score": self.openrouter_min_coding_score,
             "max_tokens": self.max_tokens,
             "reasoning_config": self.reasoning_config,
             "prefill_messages": self.prefill_messages,
@@ -944,20 +1018,23 @@ class BatchRunner:
                         except Exception as ckpt_err:
                             # Don't fail the run if checkpoint write fails
                             print(f"⚠️  Warning: Failed to save incremental checkpoint: {ckpt_err}")
+                except KeyboardInterrupt:
+                    print("\n⚠️  Interrupted — terminating batch workers...")
+                    pool.terminate()
+                    pool.join()
+                    raise
                 except Exception as e:
                     logger.error("Batch worker failed: %s", e, exc_info=True)
+                    pool.terminate()
+                    pool.join()
                     raise
                 finally:
                     root_logger.setLevel(original_level)
         
         # Aggregate all batch statistics and update checkpoint
-        all_completed_prompts = list(completed_prompts_set)
         total_reasoning_stats = {"total_assistant_turns": 0, "turns_with_reasoning": 0, "turns_without_reasoning": 0}
-        
+
         for batch_result in results:
-            # Add newly completed prompts
-            all_completed_prompts.extend(batch_result.get("completed_prompts", []))
-            
             # Aggregate tool stats
             for tool_name, stats in batch_result.get("tool_stats", {}).items():
                 if tool_name not in total_tool_stats:
@@ -977,10 +1054,10 @@ class BatchRunner:
         
         # Save final checkpoint (best-effort; incremental writes already happened)
         try:
-            checkpoint_data["completed_prompts"] = all_completed_prompts
+            checkpoint_data["completed_prompts"] = sorted(completed_prompts_set)
             self._save_checkpoint(checkpoint_data, lock=checkpoint_lock)
         except Exception as ckpt_err:
-            print(f"âš ï¸  Warning: Failed to save final checkpoint: {ckpt_err}")
+            print(f"⚠️  Warning: Failed to save final checkpoint: {ckpt_err}")
         
         # Calculate success rates
         for tool_name in total_tool_stats:
@@ -1004,6 +1081,7 @@ class BatchRunner:
         
         total_entries = 0
         filtered_entries = 0
+        tombstone_entries = 0
         batch_files_found = 0
         
         # Find ALL batch files in the output directory (handles resume merging old + new)
@@ -1019,6 +1097,14 @@ class BatchRunner:
                         total_entries += 1
                         try:
                             data = json.loads(line)
+
+                            # Discard tombstones are resume bookkeeping, not
+                            # training data (#93527) — never enter the merged
+                            # trajectories file.
+                            if data.get("discarded"):
+                                tombstone_entries += 1
+                                continue
+
                             tool_stats = data.get('tool_stats', {})
                             
                             # Check for invalid tool names (model hallucinations)
@@ -1037,7 +1123,7 @@ class BatchRunner:
         
         if filtered_entries > 0:
             print(f"⚠️  Filtered {filtered_entries} corrupted entries out of {total_entries} total")
-        print(f"✅ Combined {batch_files_found} batch files into trajectories.jsonl ({total_entries - filtered_entries} entries)")
+        print(f"✅ Combined {batch_files_found} batch files into trajectories.jsonl ({total_entries - filtered_entries - tombstone_entries} entries)")
         
         # Save final statistics
         final_stats = {
@@ -1051,6 +1137,9 @@ class BatchRunner:
             "duration_seconds": round(time.time() - start_time, 2),
             "tool_statistics": total_tool_stats,
             "reasoning_statistics": total_reasoning_stats,
+            "discarded_no_reasoning": sum(
+                r.get("discarded_no_reasoning", 0) for r in results
+            ),
         }
         
         with open(self.stats_file, 'w', encoding='utf-8') as f:
@@ -1061,7 +1150,7 @@ class BatchRunner:
         print("📊 BATCH PROCESSING COMPLETE")
         print("=" * 70)
         print(f"✅ Prompts processed this run: {sum(r.get('processed', 0) for r in results)}")
-        print(f"✅ Total trajectories in merged file: {total_entries - filtered_entries}")
+        print(f"✅ Total trajectories in merged file: {total_entries - filtered_entries - tombstone_entries}")
         print(f"✅ Total batch files merged: {batch_files_found}")
         print(f"⏱️  Total duration: {round(time.time() - start_time, 2)}s")
         print("\n📈 Tool Usage Statistics:")
@@ -1162,7 +1251,7 @@ def main(
         providers_order (str): Comma-separated list of OpenRouter providers to try in order (e.g. "anthropic,openai,google")
         provider_sort (str): Sort providers by "price", "throughput", or "latency" (OpenRouter only)
         max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
-        reasoning_effort (str): OpenRouter reasoning effort level: "none", "minimal", "low", "medium", "high", "xhigh" (default: "medium")
+        reasoning_effort (str): Reasoning effort: "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" (default: "medium")
         reasoning_disabled (bool): Completely disable reasoning/thinking tokens (default: False)
         prefill_messages_file (str): Path to JSON file containing prefill messages (list of {role, content} dicts)
         max_samples (int): Only process the first N samples from the dataset (optional, processes all if not set)
@@ -1207,21 +1296,21 @@ def main(
     # Validate required arguments
     if not dataset_file:
         print("❌ Error: --dataset_file is required")
-        return
-    
+        raise SystemExit(1)
+
     if not batch_size or batch_size < 1:
         print("❌ Error: --batch_size must be a positive integer")
-        return
-    
+        raise SystemExit(1)
+
     if not run_name:
         print("❌ Error: --run_name is required")
-        return
-    
+        raise SystemExit(1)
+
     # Parse provider preferences (comma-separated strings to lists)
     providers_allowed_list = [p.strip() for p in providers_allowed.split(",")] if providers_allowed else None
     providers_ignored_list = [p.strip() for p in providers_ignored.split(",")] if providers_ignored else None
     providers_order_list = [p.strip() for p in providers_order.split(",")] if providers_order else None
-    
+
     # Build reasoning_config from CLI flags
     # --reasoning_disabled takes priority, then --reasoning_effort, then default (medium)
     reasoning_config = None
@@ -1231,13 +1320,13 @@ def main(
         print("🧠 Reasoning: DISABLED (effort=none)")
     elif reasoning_effort:
         # Use specified effort level
-        valid_efforts = ["none", "minimal", "low", "medium", "high", "xhigh"]
+        valid_efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
         if reasoning_effort not in valid_efforts:
             print(f"❌ Error: --reasoning_effort must be one of: {', '.join(valid_efforts)}")
-            return
+            raise SystemExit(1)
         reasoning_config = {"enabled": True, "effort": reasoning_effort}
         print(f"🧠 Reasoning effort: {reasoning_effort}")
-    
+
     # Load prefill messages from JSON file if provided
     prefill_messages = None
     if prefill_messages_file:
@@ -1246,12 +1335,12 @@ def main(
                 prefill_messages = json.load(f)
             if not isinstance(prefill_messages, list):
                 print("❌ Error: prefill_messages_file must contain a JSON array of messages")
-                return
+                raise SystemExit(1)
             print(f"💬 Loaded {len(prefill_messages)} prefill messages from {prefill_messages_file}")
         except Exception as e:
             print(f"❌ Error loading prefill messages: {e}")
-            return
-    
+            raise SystemExit(1)
+
     # Initialize and run batch runner
     try:
         runner = BatchRunner(
@@ -1278,12 +1367,12 @@ def main(
         )
 
         runner.run(resume=resume)
-    
+
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
         if verbose:
             traceback.print_exc()
-        return 1
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,14 @@
 ---
-title: "Openhue — Control Philips Hue lights, rooms, and scenes via the OpenHue CLI"
+title: "Openhue — Control Philips Hue lights, scenes, rooms via OpenHue CLI"
 sidebar_label: "Openhue"
-description: "Control Philips Hue lights, rooms, and scenes via the OpenHue CLI"
+description: "Control Philips Hue lights, scenes, rooms via OpenHue CLI"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Openhue
 
-Control Philips Hue lights, rooms, and scenes via the OpenHue CLI. Turn lights on/off, adjust brightness, color, color temperature, and activate scenes.
+Control Philips Hue lights, scenes, rooms via OpenHue CLI.
 
 ## Skill metadata
 
@@ -16,9 +16,10 @@ Control Philips Hue lights, rooms, and scenes via the OpenHue CLI. Turn lights o
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/smart-home/openhue` |
-| Version | `1.0.0` |
+| Version | `1.0.1` |
 | Author | community |
 | License | MIT |
+| Platforms | linux, macos, windows |
 | Tags | `Smart-Home`, `Hue`, `Lights`, `IoT`, `Automation` |
 
 ## Reference: full SKILL.md
@@ -34,8 +35,11 @@ Control Philips Hue lights and scenes via a Hue Bridge from the terminal.
 ## Prerequisites
 
 ```bash
-# Linux (pre-built binary)
-curl -sL https://github.com/openhue/openhue-cli/releases/latest/download/openhue-linux-amd64 -o ~/.local/bin/openhue && chmod +x ~/.local/bin/openhue
+# Linux (pre-built binary — releases ship tarballs, not bare binaries)
+curl -sL "https://github.com/openhue/openhue-cli/releases/latest/download/openhue_Linux_x86_64.tar.gz" \
+  | tar -xz -C /tmp openhue \
+  && install -m 0755 /tmp/openhue ~/.local/bin/openhue
+# (use openhue_Linux_arm64.tar.gz on ARM64)
 
 # macOS
 brew install openhue/cli/openhue-cli
