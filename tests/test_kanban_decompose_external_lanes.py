@@ -252,8 +252,8 @@ def test_retry_policy_defaults_and_clamps():
         "attempts 99 -> clamp 成 5（不得無限重試）",
     )
     check(
-        kd._resolve_retry_policy({"kanban": {"decompose_retry_base_seconds": 999}})[1] == 30.0,
-        "backoff 上限 30s",
+        kd._resolve_retry_policy({"kanban": {"decompose_retry_base_seconds": 999}})[1] == 10.0,
+        "backoff base 上限 10s",
     )
     check(
         kd._resolve_retry_policy({"kanban": {"decompose_retry_attempts": "oops"}}) == (3, 2.0),
@@ -279,6 +279,38 @@ def test_failure_evidence_never_raises():
         check(False, f"寫證據時炸了: {type(exc).__name__}")
 
 
+def test_backoff_is_bounded():
+    print("\ntest_backoff_is_bounded  [#12 crosscheck]")
+    check(kd._resolve_retry_policy({"kanban": {"decompose_retry_base_seconds": 999}})[1] == 10.0,
+          "base 上限降到 10s（外層不該疊在 call_llm 自己的重試之上拖一小時）")
+    check(kd._MAX_RETRY_SLEEP_SECONDS == 30.0, "單次 sleep 硬上限 30s")
+    attempts, base = kd._resolve_retry_policy({"kanban": {
+        "decompose_retry_attempts": 99, "decompose_retry_base_seconds": 999}})
+    total = sum(min(base * (2 ** (i - 1)), kd._MAX_RETRY_SLEEP_SECONDS)
+                for i in range(1, attempts))
+    check(total <= 90.0, f"最壞情況總 backoff {total}s <= 90s")
+
+
+def test_permanent_failures_are_not_retried():
+    print("\ntest_permanent_failures_are_not_retried  [#12 crosscheck]")
+    for reason in ["LLM error: AuthenticationError", "LLM error: PermissionDeniedError",
+                   "LLM error: NotFoundError", "LLM error: BadRequestError",
+                   "LLM error: InvalidRequestError"]:
+        check(kd._is_permanent_llm_failure(reason), f"{reason} 判為永久，不重試")
+    for reason in ["LLM error: APIError", "LLM error: APITimeoutError",
+                   "LLM error: RateLimitError", "LLM returned malformed JSON"]:
+        check(not kd._is_permanent_llm_failure(reason), f"{reason} 判為可重試")
+
+
+def test_post_parse_failure_carries_attempts_and_evidence():
+    print("\ntest_post_parse_failure_carries_attempts_and_evidence  [#12 crosscheck]")
+    out = kd._fail_after_parse("t_nonexistent", "cc", "DB rejected graph: cycle", 3)
+    check(out.ok is False, "回傳失敗")
+    check(out.attempts == 3, "帶上實際 attempts（不是 dataclass 預設 1）")
+    check(out.transient is False, "schema/DB 類失敗不標 transient")
+    check("cycle" in out.reason, "保留原始原因")
+
+
 if __name__ == "__main__":
     test_load_worker_lanes()
     test_missing_manifest_is_graceful()
@@ -293,6 +325,9 @@ if __name__ == "__main__":
     test_retry_policy_defaults_and_clamps()
     test_outcome_carries_attempts_and_transient()
     test_failure_evidence_never_raises()
+    test_backoff_is_bounded()
+    test_permanent_failures_are_not_retried()
+    test_post_parse_failure_carries_attempts_and_evidence()
 
     print()
     if FAILURES:

@@ -103,3 +103,39 @@ def test_done_task_is_not_blockable(kanban_home):
         # Blocking must not resurrect finished work.
         assert kb.block_task(conn, task, reason="x", kind="needs_input") is False
         assert kb.get_task(conn, task).status == "done"
+
+def test_manual_hold_survives_block_unblock(kanban_home):
+    """A card parked in todo with no open parent must stay parked.
+
+    Found by cc-crosscheck: unblock re-gated only on parents, so a manually
+    held card (auto_promote=False, or all parents already done) was released
+    into ``ready`` by an unblock — the block silently started the work it was
+    meant to pause.
+    """
+    with kb.connect_closing() as conn:
+        parent, child = _parent_and_child(conn)
+        kb.complete_task(conn, parent)
+        assert kb.get_task(conn, child).status == "ready"
+
+        # Park it by hand, the way an operator holds a card back.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' WHERE id = ?", (child,)
+            )
+        assert kb.get_task(conn, child).status == "todo"
+
+        assert kb.block_task(conn, child, reason="hold", kind="needs_input") is True
+        assert kb.get_task(conn, child).status == "blocked"
+
+        assert kb.unblock_task(conn, child) is True
+        assert kb.get_task(conn, child).status == "todo"
+
+
+def test_unblock_from_ready_still_returns_to_ready(kanban_home):
+    """The todo fix must not swallow the ordinary ready -> blocked -> ready path."""
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="standalone")
+        assert kb.get_task(conn, task).status == "ready"
+        kb.block_task(conn, task, reason="stop", kind="needs_input")
+        assert kb.unblock_task(conn, task) is True
+        assert kb.get_task(conn, task).status == "ready"

@@ -394,10 +394,51 @@ def _resolve_retry_policy(cfg: dict) -> tuple[int, float]:
         base = float(kanban_cfg.get("decompose_retry_base_seconds", _DEFAULT_RETRY_BASE_SECONDS))
     except (TypeError, ValueError):
         base = _DEFAULT_RETRY_BASE_SECONDS
-    # Never disable retry entirely and never let a typo wedge a sweep.
+    # Never disable retry entirely and never let a typo wedge a sweep. The
+    # base is capped low because ``call_llm`` already retries inside the
+    # provider; stacking a long outer backoff on top of that can park a sweep
+    # for an hour. Individual sleeps are capped again at call time.
     attempts = max(1, min(attempts, 5))
-    base = max(0.0, min(base, 30.0))
+    base = max(0.0, min(base, 10.0))
     return attempts, base
+
+
+#: Hard ceiling on any single backoff sleep, whatever the configured base.
+_MAX_RETRY_SLEEP_SECONDS = 30.0
+
+#: Exception-name fragments that mean "retrying will not help".
+_PERMANENT_LLM_ERROR_HINTS = (
+    "authentication", "authorization", "permission", "credential",
+    "notfound", "invalidrequest", "badrequest", "unsupported",
+)
+
+
+def _is_permanent_llm_failure(reason: str) -> bool:
+    """Whether an auxiliary failure is worth another attempt.
+
+    ``call_llm`` raises provider-specific exception types; we only see the
+    class name. Anything that reads as auth/config/shape is permanent — waiting
+    two seconds and asking again produces the identical error and buys nothing
+    but a slower failure.
+    """
+    lowered = reason.replace("_", "").replace(" ", "").lower()
+    return any(hint in lowered for hint in _PERMANENT_LLM_ERROR_HINTS)
+
+
+def _fail_after_parse(
+    task_id: str, author: str, reason: str, attempts: int
+) -> "DecomposeOutcome":
+    """Fail a decomposition that got a usable response but could not land it.
+
+    Schema violations, graph rejections and DB errors are not retried — the
+    same prompt would produce the same shape — but they must still leave
+    evidence on the task, otherwise a ``--all`` sweep drops the card as
+    quietly as a provider outage used to.
+    """
+    _record_failure_evidence(task_id, author, reason, attempts)
+    return DecomposeOutcome(
+        task_id, False, reason, attempts=attempts, transient=False,
+    )
 
 
 def _record_failure_evidence(
@@ -640,14 +681,19 @@ def decompose_task(
                 attempt, max_attempts, task_id,
             )
 
+        if _is_permanent_llm_failure(last_reason):
+            # Auth/config problems do not heal by waiting. Stop immediately so
+            # the operator sees the real cause instead of a slow timeout.
+            break
         if attempt < max_attempts and retry_base > 0:
-            time.sleep(retry_base * (2 ** (attempt - 1)))
+            time.sleep(min(retry_base * (2 ** (attempt - 1)), _MAX_RETRY_SLEEP_SECONDS))
 
     if parsed is None:
         _record_failure_evidence(task_id, audit_author, last_reason, attempt)
         return DecomposeOutcome(
             task_id, False, f"{last_reason} (after {attempt} attempt(s))",
-            attempts=attempt, transient=True,
+            attempts=attempt,
+            transient=not _is_permanent_llm_failure(last_reason),
         )
 
     fanout = bool(parsed.get("fanout"))
@@ -696,6 +742,7 @@ def decompose_task(
             if not ok:
                 return DecomposeOutcome(
                     task_id, False, "task moved out of triage before promotion",
+                    attempts=attempt,
                 )
             return DecomposeOutcome(
                 task_id, True, "single task (no fanout)",
@@ -704,8 +751,9 @@ def decompose_task(
 
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
-        return DecomposeOutcome(
-            task_id, False, "decomposer returned fanout=true with empty tasks list",
+        return _fail_after_parse(
+            task_id, audit_author,
+            "decomposer returned fanout=true with empty tasks list", attempt,
         )
 
     # Rewrite invalid assignees to the default fallback. Never leave a
@@ -713,13 +761,14 @@ def decompose_task(
     children: list[dict] = []
     for idx, entry in enumerate(raw_tasks):
         if not isinstance(entry, dict):
-            return DecomposeOutcome(
-                task_id, False, f"tasks[{idx}] is not an object",
+            return _fail_after_parse(
+                task_id, audit_author, f"tasks[{idx}] is not an object", attempt,
             )
         title = entry.get("title")
         if not isinstance(title, str) or not title.strip():
-            return DecomposeOutcome(
-                task_id, False, f"tasks[{idx}].title is missing or empty",
+            return _fail_after_parse(
+                task_id, audit_author,
+                f"tasks[{idx}].title is missing or empty", attempt,
             )
         body = entry.get("body")
         if not isinstance(body, str):
@@ -776,14 +825,20 @@ def decompose_task(
                 auto_promote=auto_promote,
             )
     except ValueError as exc:
-        return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
+        return _fail_after_parse(
+            task_id, audit_author, f"DB rejected graph: {exc}", attempt,
+        )
     except Exception as exc:
         logger.exception("decompose: DB error on task %s", task_id)
-        return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
+        return _fail_after_parse(
+            task_id, audit_author, f"DB error: {type(exc).__name__}", attempt,
+        )
 
     if child_ids is None:
+        # Someone else moved the card; not our failure to comment on.
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
+            attempts=attempt,
         )
 
     return DecomposeOutcome(

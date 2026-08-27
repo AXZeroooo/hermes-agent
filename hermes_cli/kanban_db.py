@@ -4478,13 +4478,22 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
-def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
+def _resume_status_from_events(
+    conn: sqlite3.Connection, task_id: str, *, allow_todo: bool = False
+) -> str:
     """Return the durable phase a blocked/dependency-wait task should resume.
 
     Events written by review workers carry ``source_status``/``retry_status``;
     an explicit unblock that must wait for parents carries ``resume_status``.
     Legacy events omit these fields and therefore retain the historical
     ``ready`` behavior.
+
+    ``allow_todo`` is for the explicit-unblock path only. A card blocked out of
+    ``todo`` should resume to ``todo``: it was parked either behind an open
+    parent or by a deliberate manual hold, and unblocking must restore that,
+    not release the work. ``recompute_ready`` must NOT pass it — that path only
+    runs once every parent is terminal, so "still waiting" is no longer true
+    and a ``todo`` answer there would wedge the card permanently.
     """
     row = conn.execute(
         "SELECT payload FROM task_events "
@@ -4504,6 +4513,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     for key in ("resume_status", "retry_status", "source_status"):
         if payload.get(key) == "review":
             return "review"
+    if allow_todo:
+        for key in ("resume_status", "retry_status", "source_status"):
+            if payload.get(key) == "todo":
+                return "todo"
     return "ready"
 
 
@@ -6917,7 +6930,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (task_id,),
         ).fetchone()
         resume_status = (
-            _resume_status_from_events(conn, task_id)
+            _resume_status_from_events(conn, task_id, allow_todo=True)
             if current and current["status"] == "blocked"
             else "ready"
         )
@@ -6927,11 +6940,14 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         # Re-gate on parent completion before restoring the source phase.
         landing_status = _landing_status_after_parents(conn, task_id)
-        new_status = (
-            "review"
-            if landing_status == "ready" and resume_status == "review"
-            else landing_status
-        )
+        if landing_status == "ready" and resume_status in ("review", "todo"):
+            # Parents are satisfied, but the card did not come from the work
+            # pool: it was in review, or it was parked in ``todo`` (an open
+            # parent at block time, or a deliberate manual hold). Unblocking
+            # restores where it was — it does not promote it into the pool.
+            new_status = resume_status
+        else:
+            new_status = landing_status
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
