@@ -3173,10 +3173,13 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
         return 2
 
     ok_count = 0
+    failed: list[tuple[str, str]] = []
     for tid in ids:
         outcome = decomp.decompose_task(tid, author=author)
         if outcome.ok:
             ok_count += 1
+        else:
+            failed.append((outcome.task_id, outcome.reason))
         if want_json:
             print(json.dumps({
                 "task_id": outcome.task_id,
@@ -3185,6 +3188,8 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                 "fanout": outcome.fanout,
                 "child_ids": outcome.child_ids,
                 "new_title": outcome.new_title,
+                "attempts": outcome.attempts,
+                "transient": outcome.transient,
             }))
         elif outcome.ok:
             if outcome.fanout and outcome.child_ids:
@@ -3210,7 +3215,21 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
             )
     if not all_flag:
         return 0 if ok_count == 1 else 1
-    return 0 if (ok_count > 0 or not ids) else 1
+
+    # A sweep must never look like a no-op when tasks were dropped. Every
+    # failure is already commented onto its task; summarise here so the
+    # operator sees it without re-reading the board.
+    if failed and not want_json:
+        print(
+            f"kanban: decompose --all: {ok_count}/{len(ids)} decomposed, "
+            f"{len(failed)} left in triage:",
+            file=sys.stderr,
+        )
+        for tid, reason in failed:
+            print(f"  {tid}: {reason}", file=sys.stderr)
+    # Partial success is still a failed sweep: exit non-zero so a cron or
+    # supervisor notices instead of treating it as clean.
+    return 0 if not failed else 1
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:

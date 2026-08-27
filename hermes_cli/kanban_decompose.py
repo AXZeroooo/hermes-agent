@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -142,6 +143,10 @@ class DecomposeOutcome:
     fanout: bool = False
     child_ids: list[str] | None = None
     new_title: Optional[str] = None
+    #: How many auxiliary-LLM attempts were spent (1 when it worked first try).
+    attempts: int = 1
+    #: True when the failure looked retryable and every attempt was used up.
+    transient: bool = False
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -367,6 +372,60 @@ def _normalize_assignee_choice(
     return chosen
 
 
+_DEFAULT_RETRY_ATTEMPTS = 3
+_DEFAULT_RETRY_BASE_SECONDS = 2.0
+
+
+def _resolve_retry_policy(cfg: dict) -> tuple[int, float]:
+    """Return (max_attempts, base_delay_seconds) for the auxiliary call.
+
+    The decomposer's auxiliary provider fails transiently often enough that a
+    single attempt silently drops work during a ``--all`` sweep — the operator
+    sees "0 decomposed" and no reason to look further. Bounded retry with
+    exponential backoff turns that into either a success or a recorded,
+    visible failure.
+    """
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    try:
+        attempts = int(kanban_cfg.get("decompose_retry_attempts", _DEFAULT_RETRY_ATTEMPTS))
+    except (TypeError, ValueError):
+        attempts = _DEFAULT_RETRY_ATTEMPTS
+    try:
+        base = float(kanban_cfg.get("decompose_retry_base_seconds", _DEFAULT_RETRY_BASE_SECONDS))
+    except (TypeError, ValueError):
+        base = _DEFAULT_RETRY_BASE_SECONDS
+    # Never disable retry entirely and never let a typo wedge a sweep.
+    attempts = max(1, min(attempts, 5))
+    base = max(0.0, min(base, 30.0))
+    return attempts, base
+
+
+def _record_failure_evidence(
+    task_id: str, author: str, reason: str, attempts: int
+) -> None:
+    """Leave the failure on the task itself.
+
+    A permanent decompose failure must not be a stderr line that scrolls away:
+    the task stays in triage and carries a comment saying why, so the next
+    reconciliation sees it.
+    """
+    try:
+        with kb.connect_closing() as conn:
+            kb.add_comment(
+                conn,
+                task_id,
+                author or "decomposer",
+                f"decompose failed after {attempts} attempt(s): {reason}. "
+                f"Task remains in triage; rerun "
+                f"`hermes kanban decompose {task_id}` once the cause is fixed.",
+            )
+    except Exception as exc:  # noqa: BLE001 - evidence must never mask the error
+        logger.warning(
+            "decompose: could not record failure evidence on %s: %s",
+            task_id, exc,
+        )
+
+
 def _expand_external_lane_pairs(
     children: list[dict],
     review_pairs: dict[str, str],
@@ -535,38 +594,63 @@ def decompose_task(
         default_assignee=default_assignee,
     )
 
-    try:
-        # Route through call_llm so auxiliary.kanban_decomposer.* config
-        # (provider/model/base_url, extra_body, reasoning_effort, retries)
-        # all apply — the previous direct client.chat.completions.create()
-        # path dropped auxiliary.<task>.extra_body entirely (#35566).
-        resp = call_llm(
-            task="kanban_decomposer",
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-            timeout=timeout or 180,
-        )
-    except Exception as exc:
-        logger.info(
-            "decompose: API call failed for %s (%s)", task_id, exc,
-        )
-        return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
+    max_attempts, retry_base = _resolve_retry_policy(cfg)
+    audit_author = author or _profile_author()
+    parsed: Optional[dict] = None
+    last_reason = "LLM error"
+    attempt = 0
 
-    try:
-        raw = resp.choices[0].message.content or ""
-    except Exception:
-        raw = ""
+    # Bounded retry with exponential backoff. Both a provider error and a
+    # malformed body are retryable: the same prompt usually succeeds on the
+    # next attempt, and a sweep that gives up after one try drops the task
+    # with nothing but a stderr line the operator never sees.
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Route through call_llm so auxiliary.kanban_decomposer.* config
+            # (provider/model/base_url, extra_body, reasoning_effort, retries)
+            # all apply.
+            resp = call_llm(
+                task="kanban_decomposer",
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.3,
+                max_tokens=4000,
+                timeout=timeout or 180,
+            )
+        except Exception as exc:
+            last_reason = f"LLM error: {type(exc).__name__}"
+            logger.info(
+                "decompose: attempt %d/%d failed for %s (%s)",
+                attempt, max_attempts, task_id, exc,
+            )
+        else:
+            try:
+                raw = resp.choices[0].message.content or ""
+            except Exception:
+                raw = ""
+            candidate = _extract_json_blob(raw)
+            if candidate is not None:
+                parsed = candidate
+                break
+            last_reason = "LLM returned malformed JSON"
+            logger.info(
+                "decompose: attempt %d/%d returned malformed JSON for %s",
+                attempt, max_attempts, task_id,
+            )
 
-    parsed = _extract_json_blob(raw)
+        if attempt < max_attempts and retry_base > 0:
+            time.sleep(retry_base * (2 ** (attempt - 1)))
+
     if parsed is None:
-        return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
+        _record_failure_evidence(task_id, audit_author, last_reason, attempt)
+        return DecomposeOutcome(
+            task_id, False, f"{last_reason} (after {attempt} attempt(s))",
+            attempts=attempt, transient=True,
+        )
 
     fanout = bool(parsed.get("fanout"))
-    audit_author = author or _profile_author()
 
     if not fanout:
         # Fall back to single-task spec promotion (same effect as specify).
@@ -615,7 +699,7 @@ def decompose_task(
                 )
             return DecomposeOutcome(
                 task_id, True, "single task (no fanout)",
-                fanout=False, new_title=title_val,
+                fanout=False, new_title=title_val, attempts=attempt,
             )
 
     raw_tasks = parsed.get("tasks") or []
@@ -704,7 +788,7 @@ def decompose_task(
 
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",
-        fanout=True, child_ids=child_ids,
+        fanout=True, child_ids=child_ids, attempts=attempt,
     )
 
 

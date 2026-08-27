@@ -232,6 +232,53 @@ def test_root_assignee_mixed_falls_back():
     )
 
 
+# ── hermesteam#12: bounded retry / backoff ───────────────────────────────
+
+def test_retry_policy_defaults_and_clamps():
+    print("\ntest_retry_policy_defaults_and_clamps  [#12]")
+    check(kd._resolve_retry_policy({}) == (3, 2.0), "無設定 -> (3, 2.0)")
+    check(
+        kd._resolve_retry_policy({"kanban": {"decompose_retry_attempts": 2,
+                                             "decompose_retry_base_seconds": 0.5}})
+        == (2, 0.5),
+        "讀得到自訂值",
+    )
+    check(
+        kd._resolve_retry_policy({"kanban": {"decompose_retry_attempts": 0}})[0] == 1,
+        "attempts 0 -> clamp 成 1（不得完全關閉重試）",
+    )
+    check(
+        kd._resolve_retry_policy({"kanban": {"decompose_retry_attempts": 99}})[0] == 5,
+        "attempts 99 -> clamp 成 5（不得無限重試）",
+    )
+    check(
+        kd._resolve_retry_policy({"kanban": {"decompose_retry_base_seconds": 999}})[1] == 30.0,
+        "backoff 上限 30s",
+    )
+    check(
+        kd._resolve_retry_policy({"kanban": {"decompose_retry_attempts": "oops"}}) == (3, 2.0),
+        "壞值 -> 回預設，不炸",
+    )
+
+
+def test_outcome_carries_attempts_and_transient():
+    print("\ntest_outcome_carries_attempts_and_transient  [#12]")
+    ok = kd.DecomposeOutcome("t_1", True, "done")
+    check(ok.attempts == 1 and ok.transient is False, "成功預設 attempts=1, transient=False")
+    bad = kd.DecomposeOutcome("t_2", False, "LLM error", attempts=3, transient=True)
+    check(bad.attempts == 3 and bad.transient is True, "耗盡重試後可帶 attempts/transient")
+
+
+def test_failure_evidence_never_raises():
+    print("\ntest_failure_evidence_never_raises  [#12]")
+    # 不存在的 task id：add_comment 會丟 ValueError，helper 必須吞掉
+    try:
+        kd._record_failure_evidence("t_does_not_exist", "cc", "LLM error", 3)
+        check(True, "寫證據失敗不得往上炸（否則會蓋掉真正的錯誤原因）")
+    except Exception as exc:
+        check(False, f"寫證據時炸了: {type(exc).__name__}")
+
+
 if __name__ == "__main__":
     test_load_worker_lanes()
     test_missing_manifest_is_graceful()
@@ -243,6 +290,9 @@ if __name__ == "__main__":
     test_security_request_forces_security_owner()
     test_root_assignee_external_lanes_excluded()
     test_root_assignee_mixed_falls_back()
+    test_retry_policy_defaults_and_clamps()
+    test_outcome_carries_attempts_and_transient()
+    test_failure_evidence_never_raises()
 
     print()
     if FAILURES:

@@ -2764,6 +2764,19 @@ DEFAULT_CONFIG = {
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
         "auto_decompose_per_tick": 3,
+        # Bounded retry for the decomposer's auxiliary LLM call. The
+        # provider fails transiently often enough that a single attempt
+        # silently drops tasks during an --all sweep. Attempts are clamped
+        # to 1..5; backoff is base * 2**(n-1) seconds between attempts.
+        # A task that exhausts every attempt stays in Triage and gets a
+        # comment saying why, so nothing is dropped without evidence.
+        "decompose_retry_attempts": 3,
+        "decompose_retry_base_seconds": 2.0,
+        # Path to the worker-lane manifest the decomposer reads to learn
+        # which external coding lanes (codex/cc) exist and how they pair
+        # for build/review. Missing or malformed file degrades to
+        # profile-only routing.
+        "worker_lanes_file": "~/clawd/hermesteam/config/worker-lanes.yaml",
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The
