@@ -89,6 +89,14 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - CODING IMPLEMENTATION (writing/changing code, opening PRs, running
+    migrations) MUST be assigned to an EXTERNAL WORKER LANE if one is
+    listed in the roster (marked "[external worker lane]"). Never assign
+    code implementation to a functional profile — those profiles produce
+    specs, reviews and governance, not commits.
+  - Do NOT create a task that both implements AND reviews the same work.
+    Assign the implementation to an external worker lane; the system
+    automatically creates the paired review task for the other lane.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -214,12 +222,94 @@ def _resolve_default_assignee(cfg: dict) -> str:
         return "default"
 
 
-def _build_roster() -> tuple[list[dict], set[str]]:
+_DEFAULT_WORKER_LANES_FILE = "~/clawd/hermesteam/config/worker-lanes.yaml"
+
+
+def _resolve_worker_lanes_file(cfg: dict) -> str:
+    """Path to the worker-lanes manifest (kanban.worker_lanes_file)."""
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    explicit = (kanban_cfg.get("worker_lanes_file") or "").strip()
+    return os.path.expanduser(explicit or _DEFAULT_WORKER_LANES_FILE)
+
+
+def _load_worker_lanes(cfg: dict) -> tuple[dict[str, str], dict[str, str]]:
+    """Return (external_lanes, review_pairs) from the worker-lanes manifest.
+
+    ``external_lanes`` maps lane name -> human description used in the
+    decomposer roster. ``review_pairs`` maps builder lane -> reviewer lane
+    so implementation work can be split into a build + review pair.
+
+    Missing / unreadable / malformed manifest degrades to ({}, {}) so the
+    decomposer keeps working exactly as before external lanes existed.
+    """
+    path = _resolve_worker_lanes_file(cfg)
+    try:
+        import yaml  # type: ignore
+
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            data = yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        logger.debug("decompose: no worker-lanes manifest at %s", path)
+        return {}, {}
+    except Exception as exc:
+        logger.warning("decompose: failed to read worker lanes %s: %s", path, exc)
+        return {}, {}
+
+    if not isinstance(data, dict):
+        return {}, {}
+
+    lanes: dict[str, str] = {}
+    raw_lanes = data.get("external_lanes")
+    if isinstance(raw_lanes, dict):
+        for name, meta in raw_lanes.items():
+            if not isinstance(name, str) or not name.strip():
+                continue
+            meta = meta if isinstance(meta, dict) else {}
+            if meta.get("permanent_profile"):
+                # Not an external lane in the sense we care about.
+                continue
+            kind = str(meta.get("kind") or "external").strip()
+            lanes[name.strip()] = (
+                f"[external worker lane, kind={kind}] coding implementation "
+                f"worker. Assign code changes / PRs here, never to a "
+                f"functional profile."
+            )
+
+    pairs: dict[str, str] = {}
+    raw_pairs = data.get("review_pairs")
+    if isinstance(raw_pairs, list):
+        for entry in raw_pairs:
+            if not isinstance(entry, dict):
+                continue
+            builder = entry.get("builder")
+            reviewer = entry.get("reviewer")
+            if (
+                isinstance(builder, str)
+                and isinstance(reviewer, str)
+                and builder.strip()
+                and reviewer.strip()
+                and builder.strip() != reviewer.strip()
+            ):
+                pairs.setdefault(builder.strip(), reviewer.strip())
+
+    # A lane with no configured reviewer cannot enforce builder != reviewer.
+    lanes = {n: d for n, d in lanes.items() if n in pairs}
+    pairs = {b: r for b, r in pairs.items() if b in lanes}
+    return lanes, pairs
+
+
+def _build_roster(
+    external_lanes: Optional[dict[str, str]] = None,
+) -> tuple[list[dict], set[str]]:
     """Return (roster_for_prompt, valid_assignee_names).
 
     Each roster entry is ``{name, description, has_description}``. The
     valid-set is used after the LLM responds to rewrite invalid
     assignees to the default fallback.
+
+    ``external_lanes`` (name -> description) are appended to the roster so
+    coding implementation can be routed to Codex/CC worker lanes instead of
+    a functional Hermes profile. They are not on-disk profiles.
     """
     roster: list[dict] = []
     valid: set[str] = set()
@@ -236,6 +326,15 @@ def _build_roster() -> tuple[list[dict], set[str]]:
             "has_description": bool(desc),
         })
         valid.add(p.name)
+    for name, desc in (external_lanes or {}).items():
+        if name in valid:
+            continue
+        roster.append({
+            "name": name,
+            "description": desc,
+            "has_description": True,
+        })
+        valid.add(name)
     return roster, valid
 
 
@@ -268,6 +367,123 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _expand_external_lane_pairs(
+    children: list[dict],
+    review_pairs: dict[str, str],
+) -> tuple[list[dict], int]:
+    """Split every external-lane child into a build + review pair.
+
+    A child assigned to an external worker lane (e.g. ``codex``) becomes:
+
+      * the original child, retitled ``... [build]``
+      * a NEW child ``... [review]`` assigned to the paired lane
+        (``cc``), depending on the build child
+
+    Anything that previously depended on the build child is re-pointed at
+    the review child, so downstream work waits for review — not merely for
+    the builder to stop typing. Builder never reviews its own output.
+
+    Review children are appended at the end so existing indices stay valid.
+    Returns ``(children, pairs_created)``.
+    """
+    if not review_pairs:
+        return children, 0
+
+    build_to_review: dict[int, int] = {}
+    extra: list[dict] = []
+    next_index = len(children)
+
+    for idx, child in enumerate(children):
+        reviewer = review_pairs.get(child.get("assignee") or "")
+        if not reviewer:
+            continue
+        title = child.get("title") or ""
+        if not title.endswith("[build]"):
+            child["title"] = f"{title} [build]"[:200]
+        extra.append({
+            "title": f"{title} [review]"[:200],
+            "body": (
+                f"Review the implementation produced by the paired build task "
+                f"(assignee: {child.get('assignee')}).\n\n"
+                f"Build task goal:\n{child.get('body') or '(no body)'}\n\n"
+                f"Reviewer duties: verify the acceptance criteria with evidence "
+                f"(commit/PR link, command output). Request changes instead of "
+                f"editing the builder's work. Only this review task may approve "
+                f"the outcome."
+            ),
+            "assignee": reviewer,
+            "parents": [idx],
+        })
+        build_to_review[idx] = next_index
+        next_index += 1
+
+    if not build_to_review:
+        return children, 0
+
+    for idx, child in enumerate(children):
+        if idx in build_to_review:
+            continue
+        child["parents"] = [
+            build_to_review.get(p, p) for p in child.get("parents") or []
+        ]
+
+    return children + extra, len(build_to_review)
+
+
+def _resolve_root_assignee(
+    children: list[dict],
+    orchestrator: str,
+    external_lanes: Optional[set[str]] = None,
+    preferred_owner: Optional[str] = None,
+) -> str:
+    """Pick who wakes up on the root task once every child is done.
+
+    Domain-dominated work keeps its summary inside that domain: if a
+    strict majority of the domain children belong to one functional
+    profile, that profile owns the summary. A security audit therefore
+    summarises to the security profile — not to whichever gateway
+    happened to run the decomposer, and never to an unrelated domain.
+
+    Genuinely cross-domain work falls back to the orchestrator (大C), whose
+    job is exactly cross-system reconciliation.
+
+    External worker lanes are excluded from the vote: they build and
+    review code, they do not own domains and never own a summary.
+    """
+    if preferred_owner:
+        return preferred_owner
+
+    lanes = external_lanes or set()
+    owners = [
+        (child.get("assignee") or "").strip()
+        for child in children
+        if (child.get("assignee") or "").strip()
+    ]
+    domain_owners = [o for o in owners if o not in lanes]
+    if not domain_owners:
+        return orchestrator
+    counts: dict[str, int] = {}
+    for owner in domain_owners:
+        counts[owner] = counts.get(owner, 0) + 1
+    top, top_n = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
+    if top_n * 2 > len(domain_owners) and top != orchestrator:
+        return top
+    return orchestrator
+
+
+_SECURITY_REQUEST_RE = re.compile(
+    r"(?:\bsecurity\s+audit\b|\bthreat\s+model(?:ing)?\b|\bred[ -]?team\b|"
+    r"\bpenetration\s+test(?:ing)?\b|\bvulnerabilit(?:y|ies)\b|"
+    r"資安|安全(?:稽核|審計|測試)|威脅模型|漏洞|滲透測試|紅隊)",
+    re.IGNORECASE,
+)
+
+
+def _is_security_request(title: str, body: str) -> bool:
+    """Return whether the root must be owned by the security profile."""
+    return bool(_SECURITY_REQUEST_RE.search(f"{title}\n{body}"))
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -295,7 +511,15 @@ def decompose_task(
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
-    roster, valid_names = _build_roster()
+    external_lanes, review_pairs = _load_worker_lanes(cfg)
+    roster, valid_names = _build_roster(external_lanes)
+    external_lane_names = set(external_lanes) | set(review_pairs.values())
+    security_owner = (
+        "security"
+        if "security" in valid_names
+        and _is_security_request(task.title or "", task.body or "")
+        else None
+    )
 
     try:
         from agent.auxiliary_client import call_llm  # type: ignore
@@ -350,34 +574,49 @@ def decompose_task(
         new_body = parsed.get("body")
         title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
         body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
-        assignee_val = None
-        if not task.assignee:
-            assignee_val = _normalize_assignee_choice(
-                parsed.get("assignee"),
-                default_assignee=default_assignee,
-                valid_names=valid_names,
-            )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        with kb.connect_closing() as conn:
-            ok = kb.specify_triage_task(
-                conn,
-                task_id,
-                title=title_val,
-                body=body_val,
-                assignee=assignee_val,
-                author=audit_author,
-            )
-        if not ok:
-            return DecomposeOutcome(
-                task_id, False, "task moved out of triage before promotion",
-            )
-        return DecomposeOutcome(
-            task_id, True, "single task (no fanout)",
-            fanout=False, new_title=title_val,
+        requested_assignee = _normalize_assignee_choice(
+            parsed.get("assignee"),
+            default_assignee=default_assignee,
+            valid_names=valid_names,
         )
+        if requested_assignee in review_pairs:
+            # A coding task is never allowed to collapse into one card. Turn
+            # the LLM's single-task result into the same build/review graph as
+            # fanout=true, then continue through the common validation path.
+            parsed = {
+                "tasks": [{
+                    "title": title_val or task.title or "Coding implementation",
+                    "body": body_val if body_val is not None else (task.body or ""),
+                    "assignee": requested_assignee,
+                    "parents": [],
+                }]
+            }
+            fanout = True
+        else:
+            assignee_val = security_owner
+            if assignee_val is None and not task.assignee:
+                assignee_val = requested_assignee
+            with kb.connect_closing() as conn:
+                ok = kb.specify_triage_task(
+                    conn,
+                    task_id,
+                    title=title_val,
+                    body=body_val,
+                    assignee=assignee_val,
+                    author=audit_author,
+                )
+            if not ok:
+                return DecomposeOutcome(
+                    task_id, False, "task moved out of triage before promotion",
+                )
+            return DecomposeOutcome(
+                task_id, True, "single task (no fanout)",
+                fanout=False, new_title=title_val,
+            )
 
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
@@ -429,12 +668,25 @@ def decompose_task(
             "parents": clean_parents,
         })
 
+    children, pairs_created = _expand_external_lane_pairs(children, review_pairs)
+    if pairs_created:
+        logger.info(
+            "decompose: task %s created %d external build/review pair(s)",
+            task_id, pairs_created,
+        )
+    root_assignee = _resolve_root_assignee(
+        children,
+        orchestrator,
+        external_lanes=external_lane_names,
+        preferred_owner=security_owner,
+    )
+
     try:
         with kb.connect_closing() as conn:
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
-                root_assignee=orchestrator,
+                root_assignee=root_assignee,
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,

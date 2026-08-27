@@ -145,6 +145,96 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     assert task.assignee == "fallback"
 
 
+def test_decompose_fanout_false_external_lane_creates_build_review_pair(
+    kanban_home, tmp_path
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement the feature", triage=True)
+
+    manifest = tmp_path / "worker-lanes.yaml"
+    manifest.write_text(
+        "external_lanes:\n"
+        "  codex:\n    kind: external-cli-manual\n    permanent_profile: false\n"
+        "  cc:\n    kind: external-cli-manual\n    permanent_profile: false\n"
+        "review_pairs:\n"
+        "  - builder: codex\n    reviewer: cc\n"
+        "  - builder: cc\n    reviewer: codex\n",
+        encoding="utf-8",
+    )
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single coding unit",
+        "title": "Implement feature",
+        "body": "Change code and prove the acceptance criteria.",
+        "assignee": "codex",
+    })
+
+    patches = _patch_list_profiles(["default"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"worker_lanes_file": str(manifest)}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+    assert outcome.child_ids and len(outcome.child_ids) == 2
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        build = kb.get_task(conn, outcome.child_ids[0])
+        review = kb.get_task(conn, outcome.child_ids[1])
+    assert root.assignee == "default"
+    assert build.assignee == "codex"
+    assert build.title.endswith("[build]")
+    assert review.assignee == "cc"
+    assert review.title.endswith("[review]")
+    assert review.status == "todo"
+
+
+def test_security_request_forces_security_root_owner(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Security audit the gateway",
+            assignee="tro",
+            triage=True,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "cross-domain audit",
+        "tasks": [
+            {"title": "inspect runtime", "body": "inspect", "assignee": "zeo", "parents": []},
+            {"title": "record risk", "body": "record", "assignee": "tro", "parents": []},
+        ],
+    })
+    missing_manifest = tmp_path / "missing-worker-lanes.yaml"
+
+    patches = _patch_list_profiles(["default", "security", "zeo", "tro"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"worker_lanes_file": str(missing_manifest)}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+    assert root.assignee == "security"
+
+
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x")  # ready, not triage
@@ -159,5 +249,4 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
             p.stop()
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
-
 
